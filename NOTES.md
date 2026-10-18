@@ -32,7 +32,11 @@ Explicit Re-apply everything restores local settings, beginning with 0x05 →
 0x1D Custom → global/per-key 0x1A → main/side preset → all colour/mode pages.
 Preset-only restoration sends zero mode bytes to clear old overrides. Switching
 paint mode also sends the desired pages even when no keys are painted, so Apply
-can save the mode change. Linked side-light settings synchronize before Apply.
+can save the mode change. Linked side-light settings synchronize before Apply,
+clearing only the side override modes so custom key and badge colours survive.
+An independent side-colour edit selects the Single Color/custom RGB preset and
+updates remembered side LED colours even while per-key paint is off. Saved side
+overrides keep the side lights independent when their preset matches the main one.
 CLI `effect` first reads the actual active slot.
 
 Startup performs no automatic writes. The worker opens hardware only on a

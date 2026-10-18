@@ -363,7 +363,17 @@ impl App {
     /// Lighting mode and side-light link follow whatever the selected layer holds.
     fn sync_layer_ui(&mut self) {
         let l = self.state.current();
-        self.side_follow = l.side_lighting == l.lighting;
+        self.side_follow = l.side_lighting == l.lighting && l.colors[128..158].iter().all(|c| c.mode == 0);
+    }
+    fn sync_side_lighting(&mut self) {
+        if self.side_follow {
+            let l = self.state.current_mut();
+            l.side_lighting = l.lighting.clone();
+            // Side overrides would mask the followed preset.
+            for c in &mut l.colors[128..158] {
+                c.mode = 0;
+            }
+        }
     }
     fn send(&mut self, c: Command) {
         match self.tx.send(c) {
@@ -411,9 +421,7 @@ impl App {
     fn apply(&mut self) {
         match self.screen {
             Screen::Lighting => {
-                if self.side_follow {
-                    self.state.current_mut().side_lighting = self.state.current().lighting.clone();
-                }
+                self.sync_side_lighting();
                 let r = state::lighting_changes(&self.state, &self.applied);
                 self.write(r, Some(self.commit(&[Part::Preset, Part::PerKey])));
             }
@@ -739,10 +747,7 @@ impl App {
     }
 
     fn lighting(&mut self, ui: &mut Ui) {
-        if self.side_follow {
-            let l = self.state.current().lighting.clone();
-            self.state.current_mut().side_lighting = l;
-        }
+        self.sync_side_lighting();
         w::panel(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.;
             w::toolbar(ui, 860., |ui, right| {
@@ -892,10 +897,11 @@ impl App {
                     let s = &mut l.side_lighting;
                     let recoloured = w::split(ui, "Colour", |ui| w::colour_button(ui, &mut s.rgb, 28., None)).changed();
                     w::slider_int(ui, "Brightness", &format!("{}%", s.brightness), &mut s.brightness, 0.0..=100., 1.);
-                    // In per-key mode the side LEDs are entries 128..158 of the colour array.
-                    if recoloured && l.per_key_on {
-                        let rgb = l.side_lighting.rgb;
-                        l.colors[128..158].fill(KeyLight { rgb, mode: 1 });
+                    if recoloured {
+                        s.effect = 6;
+                        s.color_mode = SINGLE_COLOUR;
+                        // Keep the remembered side colour current even while paint is off.
+                        l.colors[128..158].fill(KeyLight { rgb: s.rgb, mode: 1 });
                     }
                 });
             })
@@ -1872,5 +1878,180 @@ mod tests {
             app.poll();
         }
         assert!(!app.dirty(), "switching mode on an unpainted board must not stay permanently unsaved");
+    }
+    impl Probe {
+        fn side_toggle(&mut self, app: &mut App) {
+            let label = self.texts().into_iter().find(|(t, _)| t == "Follow keyboard").unwrap().1;
+            let rect = self
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::epaint::Shape::Rect(r)
+                        if (r.rect.width() - 40.).abs() < 0.1
+                            && (r.rect.height() - 22.).abs() < 0.1
+                            && (r.rect.center().y - label.y).abs() < 5. =>
+                    {
+                        Some(r.rect)
+                    }
+                    _ => None,
+                })
+                .expect("follow toggle");
+            self.click_at(app, rect.center());
+        }
+        fn side_colour(&mut self, app: &mut App) -> [u8; 3] {
+            let old = app.state.current().side_lighting.rgb;
+            self.swatch(app, old);
+            let square = self
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Mesh(m) if m.calc_bounds().width() > 70. && m.calc_bounds().height() > 70. => {
+                        Some(m.calc_bounds())
+                    }
+                    _ => None,
+                })
+                .next_back()
+                .expect("side colour picker");
+            self.click_at(app, pos2(square.left() + square.width() * 0.5, square.top() + 10.));
+            self.click_at(app, pos2(10., 1090.));
+            let rgb = app.state.current().side_lighting.rgb;
+            assert_ne!(rgb, old);
+            rgb
+        }
+        fn erase(&mut self, app: &mut App) {
+            let at = self
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Circle(c) if c.radius >= 9. && c.radius <= 14. && c.fill == pal().surface2 => {
+                        Some(c.center)
+                    }
+                    _ => None,
+                })
+                .next_back()
+                .expect("erase swatch");
+            self.click_at(app, at);
+        }
+    }
+    #[test]
+    fn side_follow_clears_side_overrides_without_touching_key_paint() {
+        let (mut app, commands, _) = app();
+        app.side_follow = false;
+        app.state.current_mut().side_lighting.rgb = [10, 20, 30];
+        app.state.current_mut().colors[128..158].fill(KeyLight { rgb: [0, 0, 255], mode: 1 });
+        app.state.current_mut().colors[9] = KeyLight { rgb: [255, 0, 0], mode: 1 };
+        app.state.current_mut().colors[158] = KeyLight { rgb: [0, 255, 0], mode: 1 };
+        app.applied = app.state.clone();
+        let mut ui = Probe::new(&mut app);
+        ui.side_toggle(&mut app);
+        assert!(app.side_follow);
+        app.apply();
+        let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else {
+            panic!("apply follow")
+        };
+        assert_eq!(saved.current().colors[9], KeyLight { rgb: [255, 0, 0], mode: 1 });
+        assert_eq!(saved.current().colors[158], KeyLight { rgb: [0, 255, 0], mode: 1 });
+        assert!(
+            saved.current().shown_colors()[128..158].iter().all(|c| c.mode == 0),
+            "Follow keyboard must stop sending stale custom side overrides"
+        );
+        assert_eq!(reports.iter().filter(|r| r[0] == 81).count(), 3, "must send cleared side mode pages");
+    }
+    #[test]
+    fn side_colour_from_off_preset_sends_a_visible_single_colour() {
+        let (mut app, commands, _) = app();
+        app.side_follow = false;
+        let l = app.state.current_mut();
+        l.per_key_on = false;
+        l.lighting.effect = 8;
+        l.lighting.color_mode = 8;
+        l.side_lighting = l.lighting.clone();
+        l.side_lighting.rgb = [10, 20, 30];
+        app.applied = app.state.clone();
+        let mut ui = Probe::new(&mut app);
+        let rgb = ui.side_colour(&mut app);
+        app.apply();
+        let Command::Write { reports, .. } = commands.try_recv().unwrap() else { panic!("side apply") };
+        let side = reports.iter().find(|r| r[0] == 8).unwrap();
+        assert_eq!((side[1], side[4] & 15), (7, 9), "side colour picker must not send Off or leave multicolour active");
+        assert_eq!(&side[5..8], rgb);
+    }
+    #[test]
+    fn side_colour_stays_consistent_when_reenabling_per_key_paint() {
+        let (mut app, _, _) = app();
+        app.side_follow = false;
+        let l = app.state.current_mut();
+        l.per_key_on = false;
+        l.side_lighting.rgb = [10, 20, 30];
+        l.colors[128..158].fill(KeyLight { rgb: [0, 0, 255], mode: 1 });
+        let mut ui = Probe::new(&mut app);
+        let rgb = ui.side_colour(&mut app);
+        ui.click_text(&mut app, "Per-key paint");
+        assert!(app.state.current().per_key_on);
+        assert!(
+            app.state.current().shown_colors()[128..158].iter().all(|c| c.rgb == rgb),
+            "the side swatch must agree with the restored side colour bytes"
+        );
+    }
+    #[test]
+    fn side_colour_updates_exactly_30_leds_and_preserves_key_and_badge() {
+        let (mut app, commands, _) = app();
+        app.side_follow = false;
+        let l = app.state.current_mut();
+        l.side_lighting.rgb = [10, 20, 30];
+        l.colors[9] = KeyLight { rgb: [255, 0, 0], mode: 1 };
+        l.colors[158] = KeyLight { rgb: [0, 255, 0], mode: 1 };
+        app.applied = app.state.clone();
+        let mut ui = Probe::new(&mut app);
+        let rgb = ui.side_colour(&mut app);
+        app.apply();
+        let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else { panic!("apply") };
+        let bytes: Vec<_> = reports.iter().filter(|r| r[0] == 12).flat_map(|r| r[8..].to_vec()).collect();
+        let modes: Vec<_> = reports.iter().filter(|r| r[0] == 81).flat_map(|r| r[8..].to_vec()).collect();
+        assert_eq!(bytes.len(), 504);
+        assert_eq!(modes.len(), 168);
+        for i in 0..168 {
+            let expected = match i {
+                9 => ([255, 0, 0], 1),
+                128..=157 => (rgb, 1),
+                158 => ([0, 255, 0], 1),
+                _ => ([0, 0, 0], 0),
+            };
+            assert_eq!((&bytes[i * 3..i * 3 + 3], modes[i]), (expected.0.as_slice(), expected.1), "LED {i}");
+        }
+        assert_eq!(saved.current().side_lighting.rgb, rgb);
+    }
+    #[test]
+    fn erasing_selected_keys_keeps_other_keys_and_side_colours() {
+        let (mut app, commands, _) = app();
+        app.side_follow = false;
+        let l = app.state.current_mut();
+        l.colors[128..158].fill(KeyLight { rgb: [0, 0, 255], mode: 1 });
+        for k in [9, 14, 158] {
+            l.colors[k] = KeyLight { rgb: [255, 0, 0], mode: 1 };
+        }
+        app.applied = app.state.clone();
+        app.sel = BTreeSet::from([9, 158]);
+        let mut ui = Probe::new(&mut app);
+        ui.erase(&mut app);
+        app.apply();
+        let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else { panic!("apply") };
+        let modes: Vec<_> = reports.iter().filter(|r| r[0] == 81).flat_map(|r| r[8..].to_vec()).collect();
+        assert_eq!(modes[9], 0);
+        assert_eq!(modes[158], 0);
+        assert_eq!(modes[14], 1);
+        assert!(modes[128..158].iter().all(|m| *m == 1));
+        assert_eq!(saved.current().colors[14], KeyLight { rgb: [255, 0, 0], mode: 1 });
+    }
+    #[test]
+    fn saved_independent_sides_do_not_become_linked_when_preset_values_match() {
+        let (mut app, _, _) = app();
+        let rgb = app.state.current().lighting.rgb;
+        app.state.current_mut().colors[128..158].fill(KeyLight { rgb, mode: 1 });
+        app.sync_layer_ui();
+        assert!(!app.side_follow, "an independent side colour must remain independent after loading");
+        app.state.current_mut().per_key_on = false;
+        app.sync_layer_ui();
+        assert!(!app.side_follow, "hidden remembered side paint must not become linked");
     }
 }
