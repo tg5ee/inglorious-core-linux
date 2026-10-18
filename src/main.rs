@@ -22,6 +22,10 @@ fn main() -> anyhow::Result<()> {
                 .with_app_id("inglorious-core")
                 .with_inner_size([1360., 840.])
                 .with_min_inner_size([680., 480.]),
+            // With vsync the GL swap waits for a frame callback, which Hyprland never sends to a
+            // window on a hidden workspace; the blocked UI thread then misses pings and gets an
+            // "Application Not Responding" dialog (e.g. on a theme switch). Frames are on-demand anyway.
+            vsync: false,
             ..Default::default()
         },
         Box::new(move |cc| Ok(Box::new(ui::App::new(cc, state, dry)))),
