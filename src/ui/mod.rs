@@ -427,13 +427,10 @@ impl App {
             Screen::Device => {}
         }
     }
-    /// Select the slot without overwriting settings already on the keyboard.
-    fn activate(&mut self, profile: u8, layer: u8) {
-        let mut s = self.applied.clone();
-        (s.profile, s.layer) = (profile, layer);
+    /// Browse the saved slot and its draft without changing the keyboard.
+    fn select_slot(&mut self, profile: u8, layer: u8) {
         (self.state.profile, self.state.layer) = (profile, layer);
         self.sync_layer_ui();
-        self.write(p::set_profile(profile, layer).map(|r| vec![r]), Some(s));
     }
     fn start_calibration(&mut self) {
         if self.busy || self.confirm != "CALIBRATE" {
@@ -474,7 +471,6 @@ impl App {
                     self.pending_calibration = None;
                     self.live = false;
                     self.busy = false;
-                    (self.state.profile, self.state.layer) = (self.applied.profile, self.applied.layer);
                     self.notice = Some((e, true));
                 }
                 Event::Status(s) => self.notice = Some((s, false)),
@@ -523,12 +519,12 @@ impl App {
                         let width = (ui.available_width() - 12.) / 3.;
                         for (i, l) in (0u8..).zip(labels) {
                             let tip = if title == "PROFILE" {
-                                format!("Switch the board to profile {}", i + 1)
+                                format!("Edit saved profile {} — changes reach the keyboard only when applied", i + 1)
                             } else {
-                                format!("Switch the board to the {} layer", LAYERS[i as usize])
+                                format!("Edit the {} layer — changes reach the keyboard only when applied", LAYERS[i as usize])
                             };
                             if w::button_w(ui, l, Kind::Seg(i == current), Some(width)).on_hover_text(tip).clicked() && i != current {
-                                if title == "PROFILE" { self.activate(i, li) } else { self.activate(pi, i) }
+                                if title == "PROFILE" { self.select_slot(i, li) } else { self.select_slot(pi, i) }
                             }
                         }
                     });
@@ -627,7 +623,7 @@ impl App {
             (true, ..) => w::pill(ui, c.accent, if self.connected { "Working…" } else { "Connecting…" }, true),
             (_, _, Screen::Device) if !self.connected => w::pill(ui, c.danger, "Not connected", false),
             _ if dirty => w::pill(ui, c.accent, "Unsaved changes", false),
-            _ => w::pill(ui, c.ok, "Synced with keyboard", false),
+            _ => w::pill(ui, c.ok, "No unapplied changes", false),
         }
     }
     /// Ctrl+1…6 switch screens, Ctrl+S / Ctrl+Enter apply, Ctrl+Z reverts, Ctrl+R / F5 re-reads.
@@ -1608,18 +1604,44 @@ mod tests {
         (app, commands, events)
     }
     #[test]
-    fn profile_switch_only_selects_slot_and_keeps_drafts() {
+    fn profile_selection_browses_saved_slots_without_writes_and_keeps_drafts() {
         let (mut app, commands, _) = app();
-        app.state.profiles[1].layers[2].lighting.brightness = 23;
-        app.activate(1, 2);
-        let Command::Write { reports, state } = commands.recv().unwrap() else {
-            panic!("expected selection");
-        };
-        assert_eq!(reports.len(), 1, "switching must not restore defaults");
-        assert_eq!(&reports[0][..3], &[5, 1, 2]);
-        let saved = state.unwrap();
-        assert_eq!((saved.profile, saved.layer), (1, 2));
+        app.applied.profiles[1].layers[2].lighting.brightness = 23;
+        app.state = app.applied.clone();
+        app.state.current_mut().lighting.brightness = 71;
+        app.select_slot(1, 2);
+        assert!(commands.try_recv().is_err(), "browsing must never send a device command");
+        assert!(!app.busy);
+        assert_eq!((app.state.profile, app.state.layer), (1, 2));
         assert_eq!(app.state.current().lighting.brightness, 23);
+        assert!(!app.dirty());
+        assert_eq!((app.applied.profile, app.applied.layer), (0, 0));
+        app.select_slot(0, 0);
+        assert_eq!(app.state.current().lighting.brightness, 71);
+        assert!(app.dirty(), "returning to a slot must preserve its unapplied draft");
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
+    fn apply_after_browsing_targets_selected_slot_and_failure_preserves_selection() {
+        let (mut app, commands, events) = app();
+        app.select_slot(2, 1);
+        assert!(commands.try_recv().is_err());
+        app.state.current_mut().lighting.brightness = 73;
+        app.apply();
+        let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else {
+            panic!("Apply must send the draft");
+        };
+        assert_eq!((saved.profile, saved.layer), (2, 1));
+        assert_eq!(saved.current().lighting.brightness, 73);
+        assert_eq!(reports[0][0], 7);
+        assert_eq!(reports[0][3], 15);
+        assert_eq!(saved.profiles[0].layers[0].lighting.brightness, 50);
+        events.send(Event::Error("test write failure".into())).unwrap();
+        app.poll();
+        assert_eq!((app.state.profile, app.state.layer), (2, 1));
+        assert_eq!(app.state.current().lighting.brightness, 73);
+        assert_eq!(app.applied.profiles[2].layers[1].lighting.brightness, 50);
+        assert!(app.dirty());
     }
     #[test]
     fn calibration_requires_confirmation_and_advances_only_on_success() {

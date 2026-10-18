@@ -85,8 +85,11 @@ line contains all 65 bytes, starting with the zero report ID. Read replies are
 synthetic zero values, **not hardware observations**. CLI profile numbers are
 1–3; effect numbers are the original UI values (0–18), not wire opcodes.
 `effect` affects the main preset of the currently active board profile/layer.
-`profile` and the sidebar profile/layer buttons only select the board slot.
-Use Apply or Re-apply everything to write remembered settings.
+The sidebar profile/layer buttons browse the app's saved settings without sending
+anything to the keyboard. Unapplied edits stay as drafts for each slot. Apply
+writes the selected screen's changes to the selected slot; Re-apply everything
+restores its saved settings. Full profiles cannot be read back from the keyboard.
+The CLI `profile` command explicitly switches the active board slot.
 
 ## Device permissions (manual install)
 

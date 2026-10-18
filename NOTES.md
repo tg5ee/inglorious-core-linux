@@ -25,7 +25,9 @@ and text macro events. It is not a graphical macro timeline editor.
 
 Profiles/layers are zero-based internally, 1–3 in the Device UI and CLI. The
 worker selects the saved target profile/layer before un-indexed setting writes.
-Profile/layer switching sends only 0x05, preserving settings already on the board.
+Sidebar profile/layer selection only browses local saved settings/drafts; it sends
+no device command and does not persist a selection. CLI `profile` still explicitly
+switches the board with 0x05. Apply selects its edited target before writing.
 Explicit Re-apply everything restores local settings, beginning with 0x05 →
 0x1D Custom → global/per-key 0x1A → main/side preset → all colour/mode pages.
 Preset-only restoration sends zero mode bytes to clear old overrides. Switching
@@ -174,7 +176,7 @@ confirmation; calibration never advances itself. Neither is exposed by the CLI.
   Per-key painting writes the entire 168-entry array, including zeros for
   unpainted positions. A partial batch cannot be rolled back automatically.
 - External profile changes (keyboard hotkeys/another application) are not
-  subscribed to; explicit Device reads resynchronize selection. Apply reselects
+  subscribed to; explicit Device reads resynchronize the editor selection. Apply selects
   its local target. Concurrent app instances are unsupported; use one writer.
 - State JSON is backed up and replaced only after successful report sends.
   Send success is not firmware acceptance or power-cycle persistence proof.
@@ -182,7 +184,7 @@ confirmation; calibration never advances itself. Neither is exposed by the CLI.
   Dry-run intentionally does not persist previews. Errors drop cached device handles;
   the next explicit action reopens them. Failed batches are never retried automatically.
 - Reset deliberately retains saved local settings. Restore them deliberately
-  with Apply or Re-apply everything; switching profiles/layers only selects a slot.
+  with Apply or Re-apply everything; browsing profiles/layers never changes the board.
 - Updating global actuation writes ordinary magnetism data and can replace a
   selected key's advanced mode. Apply the advanced binding again afterward.
 - GUI macro editing is raw event text; it does not record input, balance press/
