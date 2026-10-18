@@ -17,13 +17,34 @@ On the desktop, following the Omarchy "Trees" theme (Glorious Mode preview):
 
 ## What works
 
-Tested on a real board: reading the device, lighting presets, per-key RGB, global
-actuation and rapid trigger. The base-effect previews in the app are drawn by the
-app and only approximate what the firmware shows.
+Tested on a real board: reading the device, lighting presets, per-key RGB, side
+lights with their own colour, following the Omarchy theme colour, global actuation
+and rapid trigger. The base-effect previews in the app are drawn by the app and only
+approximate what the firmware shows.
 
 Not yet tried on hardware: keymap, advanced keys (DKS, mod-tap, toggle, macros),
 debounce, sleep, calibration and factory reset. The board keeps its settings in
 flash, so treat those as experimental. Nothing is written until you press Apply.
+
+## Follow your Omarchy theme
+
+Turn on **Follow theme** (Lighting → Colour → Base colour) and the keyboard's base
+effect takes the Omarchy theme's `accent` colour, now and on every theme switch,
+even while the app is closed. The keyboard still runs its own animation; only the
+colour changes, so Wave, Breathing, Ripple Graff and the rest play in the theme
+colour. Side lights come along when they follow the keyboard.
+
+- The board takes one colour per effect. Multicolour mode is the firmware's own
+  rainbow, and Glorious Mode, Acid Mode, Rainbow and Heartbeat Sensor always use
+  firmware colours, so those are left as they are.
+- A theme switch costs at most one lighting write (two with followed side lights),
+  only when the colour actually changes. Nothing is streamed or polled.
+- The colour is saved for all three profiles. A profile you switch to with the
+  keyboard's Fn shortcut shows the new colour after the next Apply or theme switch.
+- It works through an Omarchy hook,
+  `~/.config/omarchy/hooks/theme-set.d/inglorious-rgb-sync`, which runs
+  `inglorious-core theme-sync`. Turning the toggle off removes the hook and leaves
+  the current colour in place.
 
 ## Install on Omarchy
 
@@ -46,8 +67,8 @@ keyboard without root. Unplug and replug the keyboard afterwards. Run it again a
 omarchy plugin remove io.github.tg5ee.inglorious-core-linux
 ```
 
-Your saved settings in `~/.config/glorious-core-rs` are kept; delete that folder too
-if you want them gone. Settings already on the keyboard stay on the keyboard.
+`uninstall.sh` also removes the Follow theme hook. Your saved settings in
+`~/.config/glorious-core-rs` are kept; delete that folder too if you want them gone. Settings already on the keyboard stay on the keyboard.
 
 ## Dependencies
 
@@ -98,6 +119,8 @@ Lighting belongs to a profile and is shared across Base, Fn and Fn2, as in CORE.
 Key bindings and actuation remain separate for each layer. Existing state files
 keep their old per-layer lighting values, but Base is the profile-wide lighting
 source. Single Color uses the chosen solid RGB colour; speed is disabled for it.
+Side lights either follow the keyboard or keep their own colour, in both preset and
+per-key modes.
 
 ## Device permissions (manual install)
 
