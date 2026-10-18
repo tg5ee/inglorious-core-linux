@@ -177,10 +177,8 @@ pub fn activate_reports(s: &State) -> Result<Vec<crate::protocol::Report>> {
     r.extend(actuation_reports(s)?);
     r.push(p::lighting(&s.current().lighting, false)?);
     r.push(p::lighting(&s.current().side_lighting, true)?);
-    // A layer painted per-key would otherwise come back showing only the preset.
-    if s.current().per_key_on && s.current().colors.iter().any(|c| c.mode != 0) {
-        r.extend(p::per_key_lighting(&s.current().colors)?);
-    }
+    // Explicit restore must also clear any overrides left on the board.
+    r.extend(p::per_key_lighting(&s.current().shown_colors())?);
     Ok(r)
 }
 /// Lighting reports for the current layer, as the original's lighting onSave sends them:
@@ -194,7 +192,7 @@ pub fn lighting_changes(new: &State, old: &State) -> Result<Vec<crate::protocol:
         r.push(p::lighting(&a.lighting, false)?);
         r.push(p::lighting(&a.side_lighting, true)?);
     }
-    if a.shown_colors() != b.shown_colors() {
+    if a.per_key_on != b.per_key_on || a.shown_colors() != b.shown_colors() {
         r.extend(p::per_key_lighting(&a.shown_colors())?);
     }
     Ok(r)
@@ -279,6 +277,27 @@ pub fn key_changes(new: &State, old: &State) -> Result<Vec<crate::protocol::Repo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reapply_always_restores_the_complete_shown_color_layer() {
+        for per_key_on in [false, true] {
+            for painted in [false, true] {
+                let mut s = State::default();
+                s.current_mut().per_key_on = per_key_on;
+                if painted {
+                    s.current_mut().colors[9] = KeyLight { rgb: [255, 0, 0], mode: 1 };
+                }
+                let reports = activate_reports(&s).unwrap();
+                let modes: Vec<_> = reports.iter().filter(|r| r[0] == 81).collect();
+                assert_eq!(modes.len(), 3, "restore must include mode pages even for preset-only lighting");
+                for (page, r) in modes.iter().enumerate() {
+                    for (offset, mode) in r[8..].iter().enumerate() {
+                        assert_eq!(*mode, u8::from(per_key_on && painted && page * 56 + offset == 9));
+                    }
+                }
+                assert_eq!(reports.iter().filter(|r| r[0] == 12).count(), 9);
+            }
+        }
+    }
     #[test]
     fn key_changes_cover_remap_reset_and_macro() {
         let old = State::default();

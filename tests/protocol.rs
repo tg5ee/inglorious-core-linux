@@ -306,7 +306,7 @@ fn sequence_and_state() {
     let r = state::activate_reports(&s).unwrap();
     assert_eq!(
         r.iter().map(|r| r[0]).collect::<Vec<_>>(),
-        [5, 29, 26, 26, 7, 8]
+        [5, 29, 26, 26, 7, 8, 12, 12, 12, 12, 12, 12, 12, 12, 12, 81, 81, 81]
     );
     assert_eq!(r[0], expected(&[5, 1, 2, 0, 0, 0, 0, 247]));
     assert_eq!(r[2][1], 33);

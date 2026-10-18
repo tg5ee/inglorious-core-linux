@@ -44,7 +44,7 @@ fn environment_dry_run_and_profile_sequence() {
         .filter(|l| l.starts_with("TX"))
         .map(|l| l.split_whitespace().nth(2).unwrap())
         .collect();
-    assert_eq!(opcodes, ["05", "1d", "1a", "07", "08"]);
+    assert_eq!(opcodes, ["05"]);
 }
 #[test]
 fn effect_and_invalid_input() {

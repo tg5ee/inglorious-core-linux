@@ -25,10 +25,13 @@ and text macro events. It is not a graphical macro timeline editor.
 
 Profiles/layers are zero-based internally, 1–3 in the Device UI and CLI. The
 worker selects the saved target profile/layer before un-indexed setting writes.
-Explicit profile activation mirrors 0x05 → 0x1D Custom → global 0x1A → per-key
-0x1A → main/side preset. Original layer activation does not resend lighting;
-this app deliberately does so for either kind of activation to keep one small,
-predictable operation. CLI `effect` first reads the actual active slot.
+Profile/layer switching sends only 0x05, preserving settings already on the board.
+Explicit Re-apply everything restores local settings, beginning with 0x05 →
+0x1D Custom → global/per-key 0x1A → main/side preset → all colour/mode pages.
+Preset-only restoration sends zero mode bytes to clear old overrides. Switching
+paint mode also sends the desired pages even when no keys are painted, so Apply
+can save the mode change. Linked side-light settings synchronize before Apply.
+CLI `effect` first reads the actual active slot.
 
 Startup performs no automatic writes. The worker opens hardware only on a
 command. It filters 342d:e3de by usage_page 0xFFFF, rejects zero/multiple matching
@@ -155,8 +158,8 @@ potential flash writes until firmware/hardware testing establishes otherwise.
 | 0x1C / 0x1E | Calibration stages | Destructive calibration write; typed gate |
 | 0x02 | Factory reset | Destructive configuration write; typed gate |
 
-CLI `info` sends only read-only queries. CLI `profile` is a configuration batch,
-not just a read. CLI `effect` reads the active slot then writes 0x07. GUI Apply
+CLI `info` sends only read-only queries. CLI `profile` writes only the profile/layer
+selection. CLI `effect` reads the active slot then writes 0x07. GUI Apply
 batches also select profile/layer first (0x05) when needed. The live checkbox and
 normal shutdown may write 0x1B. Reset/calibration only run after typing the exact
 confirmation; calibration never advances itself. Neither is exposed by the CLI.
@@ -167,7 +170,7 @@ confirmation; calibration never advances itself. Neither is exposed by the CLI.
   travel, key output, live reports and persistence across power cycles remain
   untested. GUI was compiled but never launched, per the brief.
 - The board is largely write-only. Initial local defaults do not describe the
-  current hardware. Activation explicitly reapplies local actuation/presets.
+  current hardware. Re-apply everything explicitly restores local settings.
   Per-key painting writes the entire 168-entry array, including zeros for
   unpainted positions. A partial batch cannot be rolled back automatically.
 - External profile changes (keyboard hotkeys/another application) are not
@@ -176,12 +179,10 @@ confirmation; calibration never advances itself. Neither is exposed by the CLI.
 - State JSON is backed up and replaced only after successful report sends.
   Send success is not firmware acceptance or power-cycle persistence proof.
   Backups accumulate. Corrupt state files are refused and preserved, not reset.
-  Dry-run intentionally does not persist previews. No automatic reconnect/retry.
-- Reset deliberately retains saved local settings; activation may restore them.
-  After a hardware reset, do not activate a profile if restoration is unwanted.
-- Switching profiles/layers replays actuation and presets as the source does;
-  painter arrays, macros and advanced bindings are remembered but are not
-  automatically replayed on activation. Reapply those screens deliberately.
+  Dry-run intentionally does not persist previews. Errors drop cached device handles;
+  the next explicit action reopens them. Failed batches are never retried automatically.
+- Reset deliberately retains saved local settings. Restore them deliberately
+  with Apply or Re-apply everything; switching profiles/layers only selects a slot.
 - Updating global actuation writes ordinary magnetism data and can replace a
   selected key's advanced mode. Apply the advanced binding again afterward.
 - GUI macro editing is raw event text; it does not record input, balance press/

@@ -213,6 +213,12 @@ pub fn info(t: &Transport) -> Result<Event> {
     })
 }
 pub fn worker(dry: bool) -> (Sender<Command>, Receiver<Event>, thread::JoinHandle<()>) {
+    worker_with_open(dry, move || Transport::open(dry))
+}
+fn worker_with_open(
+    dry: bool,
+    mut open: impl FnMut() -> Result<Transport> + Send + 'static,
+) -> (Sender<Command>, Receiver<Event>, thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let (et, er) = mpsc::channel();
     let join = thread::spawn(move || {
@@ -230,7 +236,7 @@ pub fn worker(dry: bool) -> (Sender<Command>, Receiver<Event>, thread::JoinHandl
                     let writing = matches!(cmd, Command::Write { .. });
                     let result = (|| -> Result<()> {
                         if transport.is_none() {
-                            transport = Some(Transport::open(dry)?);
+                            transport = Some(open()?);
                         }
                         let t = transport.as_ref().unwrap();
                         match cmd {
@@ -274,6 +280,9 @@ pub fn worker(dry: bool) -> (Sender<Command>, Receiver<Event>, thread::JoinHandl
                             let _ = et.send(Event::Done);
                         }
                         Err(e) => {
+                            // Reopen on the next explicit action; never replay a failed batch.
+                            transport = None;
+                            live = false;
                             let note = if writing {
                                 ". A partial batch may have reached the board; saved state was not advanced."
                             } else {
@@ -298,8 +307,9 @@ pub fn worker(dry: bool) -> (Sender<Command>, Receiver<Event>, thread::JoinHandl
                     }
                     Ok(None) => {}
                     Err(e) => {
+                        transport = None;
                         live = false;
-                        let _ = et.send(Event::Status(format!("Live read stopped: {e}")));
+                        let _ = et.send(Event::Error(format!("Live read stopped: {e}")));
                     }
                 }
             }
@@ -317,9 +327,7 @@ pub fn cli(dry: bool, args: &[String]) -> Result<()> {
             let mut s = load_state()?;
             s.profile = n - 1;
             s.layer = 0;
-            for r in crate::state::activate_reports(&s)? {
-                t.send(&r)?;
-            }
+            t.send(&p::set_profile(s.profile, s.layer)?)?;
             if !dry {
                 save_state(&s)?;
             }
@@ -409,6 +417,27 @@ pub fn cli(dry: bool, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_reopens_after_error_without_replaying_write() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let opens = Arc::new(AtomicUsize::new(0));
+        let count = opens.clone();
+        let (tx, rx, join) = worker_with_open(true, move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Transport::DryRun)
+        });
+        tx.send(Command::Write { reports: vec![], state: None }).unwrap();
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Error(_)));
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err(), "no automatic retry");
+        tx.send(Command::Info).unwrap();
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Info { .. }));
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Done));
+        let reopened = opens.load(Ordering::SeqCst);
+        tx.send(Command::Shutdown).unwrap();
+        join.join().unwrap();
+        assert_eq!(reopened, 2, "next action must reopen cached handles");
+    }
     #[test]
     fn persistence_backup_and_corruption() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

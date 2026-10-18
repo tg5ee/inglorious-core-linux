@@ -294,6 +294,7 @@ pub struct App {
     repeat: u8,
     confirm: String,
     calib: u8,
+    pending_calibration: Option<u8>,
     theme: Theme,
     colours: Colours,
     theme_rx: Receiver<Theme>,
@@ -350,6 +351,7 @@ impl App {
             repeat: 0,
             confirm: String::new(),
             calib: 0,
+            pending_calibration: None,
             theme,
             colours,
             theme_rx,
@@ -409,6 +411,9 @@ impl App {
     fn apply(&mut self) {
         match self.screen {
             Screen::Lighting => {
+                if self.side_follow {
+                    self.state.current_mut().side_lighting = self.state.current().lighting.clone();
+                }
                 let r = state::lighting_changes(&self.state, &self.applied);
                 self.write(r, Some(self.commit(&[Part::Preset, Part::PerKey])));
             }
@@ -422,13 +427,24 @@ impl App {
             Screen::Device => {}
         }
     }
-    /// Sidebar profile/layer switch: re-sends the last applied settings for that slot.
+    /// Select the slot without overwriting settings already on the keyboard.
     fn activate(&mut self, profile: u8, layer: u8) {
         let mut s = self.applied.clone();
         (s.profile, s.layer) = (profile, layer);
         (self.state.profile, self.state.layer) = (profile, layer);
         self.sync_layer_ui();
-        self.write(state::activate_reports(&s), Some(s));
+        self.write(p::set_profile(profile, layer).map(|r| vec![r]), Some(s));
+    }
+    fn start_calibration(&mut self) {
+        if self.busy || self.confirm != "CALIBRATE" {
+            return;
+        }
+        self.confirm.clear();
+        let stage = self.calib + 1;
+        self.write(p::calibration(stage).map(|r| vec![r]), None);
+        if self.busy {
+            self.pending_calibration = Some(stage);
+        }
     }
     fn poll(&mut self) {
         while let Ok(e) = self.rx.try_recv() {
@@ -448,8 +464,15 @@ impl App {
                 }
                 Event::Saved(s) => self.applied = *s,
                 Event::Live(v) => self.travel = v,
-                Event::Done => self.busy = false,
+                Event::Done => {
+                    self.busy = false;
+                    if let Some(stage) = self.pending_calibration.take() {
+                        self.calib = stage % 4;
+                    }
+                }
                 Event::Error(e) => {
+                    self.pending_calibration = None;
+                    self.live = false;
                     self.busy = false;
                     (self.state.profile, self.state.layer) = (self.applied.profile, self.applied.layer);
                     self.notice = Some((e, true));
@@ -824,6 +847,7 @@ impl App {
             w::card(ui, "Colour", Some("Paint colour for selected keys"), |ui| {
                 let target = if per_key { self.paint } else { self.state.current().lighting.rgb };
                 let mut pick = target;
+                let mut picked = false;
                 let mut erase = false;
                 let theme_rgb = self.theme.keyboard;
                 ui.horizontal(|ui| {
@@ -834,19 +858,21 @@ impl App {
                         let tip = format!("{} theme keyboard colour", self.theme.name.as_deref().unwrap_or("Omarchy"));
                         if w::swatch(ui, w::rgb(t), target == t, size).on_hover_text(tip).clicked() {
                             pick = t;
+                            picked = true;
                         }
                     }
                     for c in SWATCHES {
                         if w::swatch(ui, w::rgb(c), target == c, size).clicked() {
                             pick = c;
+                            picked = true;
                         }
                     }
-                    w::colour_button(ui, &mut pick, size, Some(egui_phosphor::regular::PLUS)).on_hover_text("Custom colour");
+                    picked |= w::colour_button(ui, &mut pick, size, Some(egui_phosphor::regular::PLUS)).on_hover_text("Custom colour").changed();
                     if per_key {
                         erase = w::no_colour(ui, size).on_hover_text("Remove colour: selected keys show the base effect").clicked();
                     }
                 });
-                if pick != target {
+                if picked {
                     self.set_colour(pick);
                 }
                 if erase {
@@ -1503,13 +1529,7 @@ impl App {
         });
         match act {
             Some("CALIBRATE") => {
-                self.calib += 1;
-                let stage = self.calib;
-                if stage == 4 {
-                    self.calib = 0;
-                    self.confirm.clear();
-                }
-                self.write(p::calibration(stage).map(|r| vec![r]), None);
+                self.start_calibration();
             }
             Some(_) => {
                 self.confirm.clear();
@@ -1569,5 +1589,252 @@ impl eframe::App for App {
                 });
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn app() -> (App, Receiver<Command>, Sender<Event>) {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = App::new(&cc, State::default(), true);
+        app.tx.send(Command::Shutdown).unwrap();
+        app.join.take().unwrap().join().unwrap();
+        let (tx, commands) = mpsc::channel();
+        let (events, rx) = mpsc::channel();
+        app.tx = tx;
+        app.rx = rx;
+        app.busy = false;
+        (app, commands, events)
+    }
+    #[test]
+    fn profile_switch_only_selects_slot_and_keeps_drafts() {
+        let (mut app, commands, _) = app();
+        app.state.profiles[1].layers[2].lighting.brightness = 23;
+        app.activate(1, 2);
+        let Command::Write { reports, state } = commands.recv().unwrap() else {
+            panic!("expected selection");
+        };
+        assert_eq!(reports.len(), 1, "switching must not restore defaults");
+        assert_eq!(&reports[0][..3], &[5, 1, 2]);
+        let saved = state.unwrap();
+        assert_eq!((saved.profile, saved.layer), (1, 2));
+        assert_eq!(app.state.current().lighting.brightness, 23);
+    }
+    #[test]
+    fn calibration_requires_confirmation_and_advances_only_on_success() {
+        let (mut app, commands, events) = app();
+        for stage in 1..=4 {
+            app.start_calibration();
+            assert!(commands.try_recv().is_err(), "locked stages must not write");
+            app.confirm = "CALIBRATE".into();
+            app.start_calibration();
+            assert!(app.confirm.is_empty(), "each stage must relock");
+            app.confirm = "CALIBRATE".into();
+            app.start_calibration();
+            app.confirm.clear();
+            assert_eq!(app.calib, stage - 1, "sending is not success");
+            let Command::Write { reports, state } = commands.recv().unwrap() else {
+                panic!("expected calibration");
+            };
+            assert_eq!(reports, vec![p::calibration(stage).unwrap()]);
+            assert!(state.is_none());
+            assert!(commands.try_recv().is_err(), "busy clicks must not queue stages");
+            if stage == 1 {
+                events.send(Event::Error("disconnected".into())).unwrap();
+                app.poll();
+                assert_eq!(app.calib, 0);
+                app.confirm = "CALIBRATE".into();
+                app.start_calibration();
+                let Command::Write { reports, .. } = commands.recv().unwrap() else {
+                    panic!("expected retry");
+                };
+                assert_eq!(reports, vec![p::calibration(1).unwrap()]);
+            }
+            events.send(Event::Done).unwrap();
+            app.poll();
+            assert_eq!(app.calib, stage % 4);
+            assert!(app.confirm.is_empty());
+        }
+    }
+    struct Probe {
+        ctx: egui::Context,
+        shapes: Vec<egui::epaint::ClippedShape>,
+        tick: f64,
+    }
+    impl Probe {
+        fn new(app: &mut App) -> Self {
+            let ctx = egui::Context::default();
+            w::install(&ctx);
+            let mut p = Self { ctx, shapes: vec![], tick: 0. };
+            p.frame(app, vec![]);
+            p.frame(app, vec![]);
+            p
+        }
+        fn frame(&mut self, app: &mut App, events: Vec<egui::Event>) {
+            self.tick += 0.05;
+            let out = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(pos2(0., 0.), vec2(1600., 1100.))),
+                    time: Some(self.tick),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.shortcuts(ctx);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.header_actions(ui);
+                        app.lighting(ui);
+                    });
+                },
+            );
+            self.shapes = out.shapes;
+        }
+        fn texts(&self) -> Vec<(String, egui::Pos2)> {
+            fn add(s: &egui::epaint::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+                match s {
+                    egui::epaint::Shape::Text(t) => {
+                        out.push((t.galley.job.text.clone(), t.pos + t.galley.rect.center().to_vec2()))
+                    }
+                    egui::epaint::Shape::Vec(v) => {
+                        for s in v {
+                            add(s, out)
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = vec![];
+            for s in &self.shapes {
+                add(&s.shape, &mut out)
+            }
+            out
+        }
+        fn click_at(&mut self, app: &mut App, pos: egui::Pos2) {
+            for pressed in [true, false] {
+                self.frame(
+                    app,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            self.frame(app, vec![]);
+        }
+        fn click_text(&mut self, app: &mut App, label: &str) {
+            let pos = self
+                .texts()
+                .into_iter()
+                .rev()
+                .find(|(t, _)| t == label || t.ends_with(&format!("   {label}")))
+                .unwrap_or_else(|| panic!("missing {label}; {:?}", self.texts()))
+                .1;
+            self.click_at(app, pos);
+        }
+        fn swatch(&mut self, app: &mut App, rgb: [u8; 3]) {
+            let pos = self
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::epaint::Shape::Circle(c) if c.fill == w::rgb(rgb) && c.radius >= 9. && c.radius <= 14. => {
+                        Some(c.center)
+                    }
+                    _ => None,
+                })
+                .next()
+                .expect("swatch");
+            self.click_at(app, pos);
+        }
+    }
+    #[test]
+    fn lighting_current_swatch_still_paints_new_selection() {
+        let (mut app, _, _) = app();
+        let mut ui = Probe::new(&mut app);
+        ui.click_text(&mut app, "WASD");
+        let paint = app.paint;
+        ui.swatch(&mut app, paint);
+        assert!(
+            app.sel.iter().all(|k| app.state.current().colors[*k as usize].rgb == paint
+                && app.state.current().colors[*k as usize].mode == 1),
+            "clicking the current paint colour must paint newly selected keys"
+        );
+    }
+
+    #[test]
+    fn lighting_follow_applies_current_main_settings_before_next_render() {
+        let (mut app, commands, _) = app();
+        app.side_follow = true;
+        let mut ui = Probe::new(&mut app);
+        let label = ui.texts().into_iter().find(|(t, _)| t == "Brightness").unwrap().1;
+        let rail = ui
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Rect(r)
+                    if (r.rect.height() - 6.).abs() < 0.1
+                        && r.rect.center().y > label.y
+                        && r.rect.center().y < label.y + 55. =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .max_by(|a, b| a.width().total_cmp(&b.width()))
+            .unwrap();
+        let before = app.state.current().lighting.brightness;
+        let target = pos2(rail.right() - 8., rail.center().y);
+        ui.frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(target),
+                egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(app.state.current().lighting.brightness, 100);
+        assert_ne!(before, 100);
+        ui.frame(
+            &mut app,
+            vec![egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+        );
+        let Command::Write { reports, state } = commands.try_recv().expect("Ctrl+S must apply") else {
+            panic!("apply")
+        };
+        assert_eq!(
+            &reports[0][1..8],
+            &reports[1][1..8],
+            "side follow must match the main report on Ctrl+S while moving a slider"
+        );
+        assert_eq!(state.unwrap().current().side_lighting.brightness, 100);
+    }
+    #[test]
+    fn lighting_empty_paint_mode_switch_can_finish_apply() {
+        let (mut app, commands, events) = app();
+        let mut ui = Probe::new(&mut app);
+        ui.click_text(&mut app, "Preset effect");
+        assert!(app.dirty());
+        ui.click_text(&mut app, "Apply to keyboard");
+        if let Ok(Command::Write { state: Some(saved), .. }) = commands.try_recv() {
+            events.send(Event::Saved(saved)).unwrap();
+            events.send(Event::Done).unwrap();
+            app.poll();
+        }
+        assert!(!app.dirty(), "switching mode on an unpainted board must not stay permanently unsaved");
     }
 }

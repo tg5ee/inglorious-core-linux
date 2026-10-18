@@ -85,7 +85,8 @@ line contains all 65 bytes, starting with the zero report ID. Read replies are
 synthetic zero values, **not hardware observations**. CLI profile numbers are
 1–3; effect numbers are the original UI values (0–18), not wire opcodes.
 `effect` affects the main preset of the currently active board profile/layer.
-`profile` also reapplies saved global/per-key actuation and main/side presets.
+`profile` and the sidebar profile/layer buttons only select the board slot.
+Use Apply or Re-apply everything to write remembered settings.
 
 ## Device permissions (manual install)
 
@@ -129,4 +130,4 @@ Factory reset requires typing `RESET`. Every individual calibration stage
 requires typing `CALIBRATE` again. Neither operation runs automatically, nor is
 there a CLI path for either. The app does not guide physical calibration motions;
 use a verified procedure for this exact board. Reset retains local remembered
-settings so they can be restored deliberately; activation can reapply them.
+settings so they can be restored deliberately with Re-apply everything.
