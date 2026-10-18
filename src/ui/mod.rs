@@ -280,6 +280,7 @@ pub struct App {
     sel: BTreeSet<u8>,
     key: u8,
     paint: [u8; 3],
+    paint_palette: bool,
     side_follow: bool,
     per_key_scope: bool,
     live: bool,
@@ -338,6 +339,7 @@ impl App {
             sel: BTreeSet::new(),
             key: 3,
             paint: SWATCHES[0],
+            paint_palette: false,
             side_follow: false,
             per_key_scope: false,
             live: false,
@@ -366,6 +368,7 @@ impl App {
     }
     /// Lighting mode and side-light link follow whatever the selected layer holds.
     fn sync_layer_ui(&mut self) {
+        self.paint_palette = false;
         let l = self.state.lighting_state();
         self.side_follow = l.side_lighting == l.lighting && l.colors[128..158].iter().all(|c| c.mode == 0);
     }
@@ -770,7 +773,7 @@ impl App {
         }
     }
     fn set_colour(&mut self, c: [u8; 3]) {
-        if self.state.lighting_state().per_key_on {
+        if self.paint_palette {
             self.paint = c;
             let l = self.state.lighting_state_mut();
             for k in &self.sel {
@@ -798,9 +801,11 @@ impl App {
                     let on = &mut self.state.lighting_state_mut().per_key_on;
                     if w::button(ui, "Per-key paint", Kind::Seg(*on)).on_hover_text("Painted colours on top of the base effect").clicked() {
                         *on = true;
+                        self.paint_palette = true;
                     }
                     if w::button(ui, "Preset effect", Kind::Seg(!*on)).on_hover_text("Base effect on every key; painted colours are kept").clicked() {
                         *on = false;
+                        self.paint_palette = false;
                     }
                 } else {
                     self.quick(ui, &["All", "Alphas", "Numbers", "F-keys", "WASD", "Arrows", "Modifiers", "Clear"]);
@@ -875,6 +880,7 @@ impl App {
                             if l.effect == 6 && mode == MULTICOLOUR { continue; }
                             if w::button(ui, label, Kind::Seg(l.color_mode == mode)).clicked() {
                                 l.color_mode = mode;
+                                show_effect = true;
                             }
                         }
                     });
@@ -889,13 +895,24 @@ impl App {
         });
         if show_effect {
             self.state.lighting_state_mut().per_key_on = false;
+            self.paint_palette = false;
         }
         if apply_now {
             self.apply();
         }
-        let per_key = self.state.lighting_state().per_key_on;
         w::place(ui, r[1], |ui| {
-            w::card(ui, "Colour", Some("Paint colour for selected keys"), |ui| {
+            w::card(ui, "Colour", None, |ui| {
+                ui.horizontal(|ui| {
+                    if w::button(ui, "Base colour", Kind::Seg(!self.paint_palette)).clicked() {
+                        self.paint_palette = false;
+                    }
+                    if w::button(ui, "Key paint", Kind::Seg(self.paint_palette)).clicked() {
+                        self.paint_palette = true;
+                        self.state.lighting_state_mut().per_key_on = true;
+                    }
+                });
+                let per_key = self.paint_palette;
+                ui.label(if per_key { "Paint colour for selected keys" } else { "Base effect colour" });
                 let target = if per_key { self.paint } else { self.state.lighting_state().lighting.rgb };
                 let mut pick = target;
                 let mut picked = false;
@@ -1847,10 +1864,56 @@ mod tests {
         }
     }
     #[test]
+    fn single_color_palette_edits_base_even_with_saved_per_key_lighting() {
+        let (mut app, commands, _) = app();
+        app.state.lighting_state_mut().colors[9] = KeyLight { rgb: [12, 34, 56], mode: 1 };
+        let original = app.state.lighting_state().colors.clone();
+        let mut ui = Probe::new(&mut app);
+        ui.click_text(&mut app, "WASD");
+        for rgb in SWATCHES {
+            ui.swatch(&mut app, rgb);
+            assert_eq!(app.state.lighting_state().lighting.rgb, rgb);
+        }
+        assert_eq!(app.state.lighting_state().colors, original);
+        assert!(commands.try_recv().is_err(), "palette clicks only edit the draft");
+        app.apply();
+        let Command::Write { reports, .. } = commands.try_recv().unwrap() else { panic!("apply") };
+        let main = reports.iter().find(|r| r[0] == 7).unwrap();
+        assert_eq!((main[1], main[4] & 15), (7, 9));
+        assert_eq!(&main[5..8], &SWATCHES[SWATCHES.len() - 1]);
+    }
+
+    #[test]
+    fn palette_target_switch_keeps_base_and_key_colours_separate() {
+        let (mut app, commands, _) = app();
+        let mut ui = Probe::new(&mut app);
+        ui.click_text(&mut app, "WASD");
+        ui.swatch(&mut app, SWATCHES[2]);
+        ui.click_text(&mut app, "Key paint");
+        ui.swatch(&mut app, SWATCHES[3]);
+        assert_eq!(app.state.lighting_state().lighting.rgb, SWATCHES[2]);
+        assert!(app.sel.iter().all(|k| app.state.lighting_state().colors[*k as usize].rgb == SWATCHES[3]));
+        ui.click_text(&mut app, "Base colour");
+        ui.swatch(&mut app, SWATCHES[4]);
+        assert_eq!(app.state.lighting_state().lighting.rgb, SWATCHES[4]);
+        assert!(app.sel.iter().all(|k| app.state.lighting_state().colors[*k as usize].rgb == SWATCHES[3]));
+        ui.click_text(&mut app, "Key paint");
+        ui.click_text(&mut app, "Single colour");
+        assert!(!app.paint_palette);
+        assert!(!app.state.lighting_state().per_key_on);
+        ui.click_text(&mut app, "Per-key paint");
+        assert!(app.paint_palette);
+        app.select_profile(1);
+        assert!(!app.paint_palette, "opening a profile starts with its base colour");
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
     fn lighting_current_swatch_still_paints_new_selection() {
         let (mut app, _, _) = app();
         let mut ui = Probe::new(&mut app);
         ui.click_text(&mut app, "WASD");
+        ui.click_text(&mut app, "Key paint");
         let paint = app.paint;
         ui.swatch(&mut app, paint);
         assert!(
@@ -2085,6 +2148,7 @@ mod tests {
         app.applied = app.state.clone();
         app.sel = BTreeSet::from([9, 158]);
         let mut ui = Probe::new(&mut app);
+        ui.click_text(&mut app, "Key paint");
         ui.erase(&mut app);
         app.apply();
         let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else { panic!("apply") };
