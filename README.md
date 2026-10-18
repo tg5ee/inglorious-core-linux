@@ -9,7 +9,7 @@ the official app talks to the board; see [NOTES.md](NOTES.md).
 > and GMMK are trademarks of their owner and are used here only to say which keyboard
 > this works with.
 
-![Lighting screen](preview.png)
+![Lighting screen with the Ripple Graff effect preview running](demo.gif)
 
 ## What works
 
