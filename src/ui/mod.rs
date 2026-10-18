@@ -867,7 +867,7 @@ impl App {
                 self.toggle_sel(k);
             }
         });
-        let r = w::row(ui, &[0., 360., 250.], 246.);
+        let r = w::row(ui, &[0., 360., 250.], 314.);
         let mut show_effect = false;
         let (can_apply, mut apply_now, theme_sync) = (self.needs_apply(), false, self.theme_sync);
         w::place(ui, r[0], |ui| {
