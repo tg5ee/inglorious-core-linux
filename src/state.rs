@@ -62,6 +62,7 @@ pub enum Advanced {
 #[serde(default)]
 pub struct Profile {
     pub layers: [Layer; 3],
+    pub selected_layer: u8,
     pub polling: u16,
     pub debounce: u16,
     pub sleep: u16,
@@ -70,6 +71,7 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             layers: std::array::from_fn(|_| Layer::default()),
+            selected_layer: 0,
             polling: 1000,
             debounce: 5,
             sleep: 0,
@@ -99,6 +101,7 @@ impl State {
             "invalid saved profile/layer"
         );
         for p in &self.profiles {
+            ensure!(p.selected_layer < 3, "invalid remembered layer");
             crate::protocol::report_rate(0, p.polling)?;
             crate::protocol::debounce(p.debounce)?;
             for l in &p.layers {
@@ -148,6 +151,13 @@ impl State {
         }
         Ok(())
     }
+    /// CORE stores lighting per profile. Keep the base-layer storage for file compatibility.
+    pub fn lighting_state(&self) -> &Layer {
+        &self.profiles[self.profile as usize].layers[0]
+    }
+    pub fn lighting_state_mut(&mut self) -> &mut Layer {
+        &mut self.profiles[self.profile as usize].layers[0]
+    }
     pub fn current(&self) -> &Layer {
         &self.profiles[self.profile as usize].layers[self.layer as usize]
     }
@@ -175,18 +185,18 @@ pub fn activate_reports(s: &State) -> Result<Vec<crate::protocol::Report>> {
     s.validate()?;
     let mut r = vec![p::set_profile(s.profile, s.layer)?];
     r.extend(actuation_reports(s)?);
-    r.push(p::lighting(&s.current().lighting, false)?);
-    r.push(p::lighting(&s.current().side_lighting, true)?);
+    r.push(p::lighting(&s.lighting_state().lighting, false)?);
+    r.push(p::lighting(&s.lighting_state().side_lighting, true)?);
     // Explicit restore must also clear any overrides left on the board.
-    r.extend(p::per_key_lighting(&s.current().shown_colors())?);
+    r.extend(p::per_key_lighting(&s.lighting_state().shown_colors())?);
     Ok(r)
 }
-/// Lighting reports for the current layer, as the original's lighting onSave sends them:
+/// Lighting reports for the current profile, as the original's lighting onSave sends them:
 /// the preset (keyboard + side) when it changed, then the per-key arrays when they changed.
 pub fn lighting_changes(new: &State, old: &State) -> Result<Vec<crate::protocol::Report>> {
     use crate::protocol as p;
-    let a = new.current();
-    let b = &old.profiles[new.profile as usize].layers[new.layer as usize];
+    let a = new.lighting_state();
+    let b = &old.profiles[new.profile as usize].layers[0];
     let mut r = Vec::new();
     if a.lighting != b.lighting || a.side_lighting != b.side_lighting {
         r.push(p::lighting(&a.lighting, false)?);
@@ -277,6 +287,21 @@ pub fn key_changes(new: &State, old: &State) -> Result<Vec<crate::protocol::Repo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_lighting_is_layer_independent_and_preserves_legacy_layer_data() {
+        let mut s = State::default();
+        s.lighting_state_mut().lighting.rgb = [12, 34, 56];
+        s.profiles[0].layers[2].lighting.rgb = [90, 80, 70];
+        s.layer = 2;
+        assert_eq!(s.lighting_state().lighting.rgb, [12, 34, 56]);
+        s.lighting_state_mut().colors[9] = KeyLight {rgb:[255,0,0], mode:1};
+        s.layer = 1;
+        assert_eq!(s.lighting_state().colors[9].mode, 1);
+        let restored: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(restored.profiles[0].layers[2].lighting.rgb, [90, 80, 70]);
+        s.profiles[2].selected_layer = 3;
+        assert!(s.validate().is_err());
+    }
     #[test]
     fn reapply_always_restores_the_complete_shown_color_layer() {
         for per_key_on in [false, true] {

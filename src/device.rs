@@ -132,13 +132,14 @@ pub fn load_state() -> Result<State> {
     load_state_from(&state_path()?)
 }
 pub fn load_state_from(path: &std::path::Path) -> Result<State> {
-    let s: State = match std::fs::read(path) {
+    let mut s: State = match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid state {} (left untouched)", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
         Err(e) => return Err(e.into()),
     };
     s.validate()?;
+    s.profiles[s.profile as usize].selected_layer = s.layer;
     Ok(s)
 }
 fn save_state(s: &State) -> Result<()> {
@@ -196,6 +197,7 @@ pub enum Event {
         ports: [String; 2],
     },
     Saved(Box<State>),
+    ActiveSlot { profile: u8, layer: u8 },
     Live(f32),
     Done,
     Error(String),
@@ -279,6 +281,9 @@ fn worker_with_open(
                                     t.send(r)?;
                                     let _ = et.send(Event::Progress(i + 1, n));
                                 }
+                                if reports[0][0] == 5 {
+                                    let _ = et.send(Event::ActiveSlot { profile: reports[0][1], layer: reports[0][2] });
+                                }
                                 if let Some(s) = state {
                                     if !dry {
                                         save_state(&s)?;
@@ -341,6 +346,7 @@ pub fn cli(dry: bool, args: &[String]) -> Result<()> {
             let mut s = load_state()?;
             s.profile = n - 1;
             s.layer = 0;
+            s.profiles[s.profile as usize].selected_layer = 0;
             t.send(&p::set_profile(s.profile, s.layer)?)?;
             if !dry {
                 save_state(&s)?;
@@ -351,8 +357,11 @@ pub fn cli(dry: bool, args: &[String]) -> Result<()> {
             let (profile, layer) = p::parse_profile(&t.query(&p::get_profile())?)?;
             s.profile = profile;
             s.layer = layer;
-            let a = &mut s.current_mut().lighting;
+            let a = &mut s.lighting_state_mut().lighting;
             a.effect = args[1].parse()?;
+            if a.effect == 6 {
+                a.color_mode = crate::tables::SINGLE_COLOUR;
+            }
             if let Some(v) = args.get(2) {
                 a.speed = v.parse()?;
             }
@@ -377,7 +386,8 @@ pub fn cli(dry: bool, args: &[String]) -> Result<()> {
             let (profile, layer) = p::parse_profile(&t.query(&p::get_profile())?)?;
             s.profile = profile;
             s.layer = layer;
-            let colors = &mut s.current_mut().colors;
+            s.lighting_state_mut().per_key_on = true;
+            let colors = &mut s.lighting_state_mut().colors;
             colors.fill(p::KeyLight::default());
             for spec in &args[1..] {
                 let (key, hex) = spec.split_once('=').context("expected KEY=RRGGBB")?;

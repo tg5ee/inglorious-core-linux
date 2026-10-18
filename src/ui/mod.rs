@@ -60,6 +60,7 @@ impl Screen {
 }
 fn copy(part: Part, pi: usize, li: usize, from: &State, to: &mut State) {
     let (a, b) = (&from.profiles[pi], &mut to.profiles[pi]);
+    let li = if matches!(part, Part::Preset | Part::PerKey) { 0 } else { li };
     let (la, lb) = (&a.layers[li], &mut b.layers[li]);
     match part {
         Part::Preset => {
@@ -80,6 +81,7 @@ fn copy(part: Part, pi: usize, li: usize, from: &State, to: &mut State) {
 }
 fn same(part: Part, pi: usize, li: usize, x: &State, y: &State) -> bool {
     let (a, b) = (&x.profiles[pi], &y.profiles[pi]);
+    let li = if matches!(part, Part::Preset | Part::PerKey) { 0 } else { li };
     let (la, lb) = (&a.layers[li], &b.layers[li]);
     match part {
         Part::Preset => la.lighting == lb.lighting && la.side_lighting == lb.side_lighting,
@@ -90,7 +92,7 @@ fn same(part: Part, pi: usize, li: usize, x: &State, y: &State) -> bool {
     }
 }
 
-const LAYERS: [&str; 3] = ["Base", "Fn 1", "Fn 2"];
+const LAYERS: [&str; 3] = ["Base", "Fn", "Fn2"];
 const SWATCHES: [[u8; 3]; 7] = [
     [0x1f, 0x4f, 0xff],
     [0x7b, 0x2f, 0xf7],
@@ -271,6 +273,7 @@ pub struct App {
     progress: (usize, usize),
     notice: Option<(String, bool)>,
     connected: bool,
+    board_slot: Option<(u8, u8)>,
     fw: Vec<String>,
     ports: [String; 2],
     /// Multi-selection (lighting, actuation) and single selection (keymap, advanced).
@@ -329,6 +332,7 @@ impl App {
             progress: (0, 0),
             notice: None,
             connected: false,
+            board_slot: None,
             fw: Vec::new(),
             ports: ["—".into(), "—".into()],
             sel: BTreeSet::new(),
@@ -362,12 +366,12 @@ impl App {
     }
     /// Lighting mode and side-light link follow whatever the selected layer holds.
     fn sync_layer_ui(&mut self) {
-        let l = self.state.current();
+        let l = self.state.lighting_state();
         self.side_follow = l.side_lighting == l.lighting && l.colors[128..158].iter().all(|c| c.mode == 0);
     }
     fn sync_side_lighting(&mut self) {
         if self.side_follow {
-            let l = self.state.current_mut();
+            let l = self.state.lighting_state_mut();
             l.side_lighting = l.lighting.clone();
             // Side overrides would mask the followed preset.
             for c in &mut l.colors[128..158] {
@@ -385,6 +389,25 @@ impl App {
         }
     }
     fn write(&mut self, r: anyhow::Result<Vec<p::Report>>, saved: Option<State>) {
+        let r = r.and_then(|reports| {
+            let Some(s) = saved.as_ref() else { return Ok(reports); };
+            if self.board_slot == Some((s.profile, s.layer)) {
+                return Ok(reports);
+            }
+            let profile_changed = self.board_slot.map(|slot| slot.0) != Some(s.profile);
+            let mut activation = if profile_changed {
+                state::activate_reports(s)?
+            } else {
+                let mut r = vec![p::set_profile(s.profile, s.layer)?];
+                r.extend(state::actuation_reports(s)?);
+                r
+            };
+            // Activation already includes saved actuation, and profile-wide lighting on profile changes.
+            if self.screen != Screen::Actuation && !(profile_changed && self.screen == Screen::Lighting) {
+                activation.extend(reports);
+            }
+            Ok(activation)
+        });
         match r {
             Ok(reports) if reports.is_empty() => self.notice = Some(("Nothing to write.".into(), false)),
             Ok(reports) => self.send(Command::Write { reports, state: saved.map(Box::new) }),
@@ -399,6 +422,7 @@ impl App {
         let (pi, li) = self.at();
         let mut s = self.applied.clone();
         (s.profile, s.layer) = (self.state.profile, self.state.layer);
+        s.profiles[pi].selected_layer = self.state.layer;
         for part in parts {
             copy(*part, pi, li, &self.state, &mut s);
         }
@@ -410,6 +434,9 @@ impl App {
     }
     fn dirty(&self) -> bool {
         self.screen_dirty(self.screen)
+    }
+    fn needs_apply(&self) -> bool {
+        self.dirty() || self.board_slot != Some((self.state.profile, self.state.layer))
     }
     fn revert(&mut self) {
         let (pi, li) = self.at();
@@ -438,7 +465,11 @@ impl App {
     /// Browse the saved slot and its draft without changing the keyboard.
     fn select_slot(&mut self, profile: u8, layer: u8) {
         (self.state.profile, self.state.layer) = (profile, layer);
+        self.state.profiles[profile as usize].selected_layer = layer;
         self.sync_layer_ui();
+    }
+    fn select_profile(&mut self, profile: u8) {
+        self.select_slot(profile, self.state.profiles[profile as usize].selected_layer);
     }
     fn start_calibration(&mut self) {
         if self.busy || self.confirm != "CALIBRATE" {
@@ -459,15 +490,20 @@ impl App {
                     self.fw = fw.split(" / ").map(String::from).collect();
                     self.ports = ports;
                     self.connected = true;
+                    if !self.dry {
+                        self.board_slot = Some((profile, layer));
+                    }
                     // Dry-run replies are all zeros; keep the saved slot instead.
                     if !self.dry {
                         for s in [&mut self.state, &mut self.applied] {
                             (s.profile, s.layer) = (profile, layer);
+                            s.profiles[profile as usize].selected_layer = layer;
                         }
                         self.sync_layer_ui();
                     }
                 }
                 Event::Saved(s) => self.applied = *s,
+                Event::ActiveSlot { profile, layer } => self.board_slot = Some((profile, layer)),
                 Event::Live(v) if self.live => self.travel = v,
                 Event::Live(_) => {}
                 Event::Done => {
@@ -477,6 +513,7 @@ impl App {
                     }
                 }
                 Event::Error(e) => {
+                    self.board_slot = None;
                     self.pending_calibration = None;
                     self.live = false;
                     self.busy = false;
@@ -517,23 +554,25 @@ impl App {
                 w::text(ui, status, w::body(12.), c.muted);
             });
         });
+        let active = self.board_slot.map_or_else(|| "Keyboard profile: unknown".into(), |(p, l)| format!("Keyboard (last confirmed): {} · {}", p + 1, LAYERS[l as usize]));
+        w::text(ui, active, w::body(11.), c.muted);
         ui.add_enabled_ui(!self.busy, |ui| {
             ui.spacing_mut().item_spacing.y = 24.;
             let (pi, li) = (self.state.profile, self.state.layer);
-            for (title, labels, current) in [("PROFILE", ["1", "2", "3"], pi), ("LAYER", LAYERS, li)] {
+            for (title, labels, current) in [("EDIT PROFILE", ["1", "2", "3"], pi), ("EDIT LAYER", LAYERS, li)] {
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing = vec2(6., 8.);
                     w::spaced(ui, title, w::strong(11.), c.dim, 1.5);
                     ui.horizontal(|ui| {
                         let width = (ui.available_width() - 12.) / 3.;
                         for (i, l) in (0u8..).zip(labels) {
-                            let tip = if title == "PROFILE" {
+                            let tip = if title == "EDIT PROFILE" {
                                 format!("Edit saved profile {} — changes reach the keyboard only when applied", i + 1)
                             } else {
                                 format!("Edit the {} layer — changes reach the keyboard only when applied", LAYERS[i as usize])
                             };
                             if w::button_w(ui, l, Kind::Seg(i == current), Some(width)).on_hover_text(tip).clicked() && i != current {
-                                if title == "PROFILE" { self.select_slot(i, li) } else { self.select_slot(pi, i) }
+                                if title == "EDIT PROFILE" { self.select_profile(i) } else { self.select_slot(pi, i) }
                             }
                         }
                     });
@@ -553,7 +592,7 @@ impl App {
             ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                 ui.spacing_mut().item_spacing.y = 2.;
                 w::text(ui, format!("inglorious-core {}", env!("CARGO_PKG_VERSION")), w::body(11.), c.dim);
-                w::text(ui, "Settings are stored on the keyboard.", w::body(11.), c.dim);
+                w::text(ui, "Browse here; Apply writes to keyboard.", w::body(11.), c.dim);
             });
         }
     }
@@ -562,7 +601,7 @@ impl App {
         let c = pal();
         let (pi, li) = self.at();
         let (title, sub) = match self.screen {
-            Screen::Lighting => ("Lighting", format!("Profile {} · {} — preset effect with per-key overrides", pi + 1, LAYERS[li])),
+            Screen::Lighting => ("Lighting", format!("Profile {} — shared across Base, Fn and Fn2", pi + 1)),
             Screen::Actuation => ("Actuation", "Hall-effect travel, rapid trigger and deadzone".into()),
             Screen::Keymap => ("Keymap", format!("Remap keys on Profile {} · {}", pi + 1, LAYERS[li])),
             Screen::Advanced => ("Advanced keys", "Dynamic keystroke, mod-tap, toggle and macros".into()),
@@ -619,7 +658,7 @@ impl App {
                 self.send(Command::Info);
             }
         } else {
-            let apply = ui.add_enabled_ui(!self.busy && dirty, |ui| w::button(ui, "Apply to keyboard", Kind::Primary)).inner;
+            let apply = ui.add_enabled_ui(!self.busy && self.needs_apply(), |ui| w::button(ui, "Apply to keyboard", Kind::Primary)).inner;
             if apply.on_hover_text("Write this screen's changes to the keyboard (Ctrl+S)").clicked() {
                 self.apply();
             }
@@ -631,6 +670,7 @@ impl App {
             (true, (i, n), _) if n > 0 => w::pill(ui, c.accent, &format!("Writing {i}/{n}…"), true),
             (true, ..) => w::pill(ui, c.accent, if self.connected { "Working…" } else { "Connecting…" }, true),
             (_, _, Screen::Device) if !self.connected => w::pill(ui, c.danger, "Not connected", false),
+            _ if self.board_slot != Some((self.state.profile, self.state.layer)) => w::pill(ui, c.accent, "Activation pending", false),
             _ if dirty => w::pill(ui, c.accent, "Unsaved changes", false),
             _ => w::pill(ui, c.ok, "No unapplied changes", false),
         }
@@ -651,7 +691,7 @@ impl App {
         if self.busy {
             return;
         }
-        if (hit(Modifiers::COMMAND, Key::S) || hit(Modifiers::COMMAND, Key::Enter)) && self.dirty() {
+        if (hit(Modifiers::COMMAND, Key::S) || hit(Modifiers::COMMAND, Key::Enter)) && self.needs_apply() {
             self.apply();
         }
         if hit(Modifiers::COMMAND, Key::Z) && self.dirty() {
@@ -730,15 +770,15 @@ impl App {
         }
     }
     fn set_colour(&mut self, c: [u8; 3]) {
-        if self.state.current().per_key_on {
+        if self.state.lighting_state().per_key_on {
             self.paint = c;
-            let l = self.state.current_mut();
+            let l = self.state.lighting_state_mut();
             for k in &self.sel {
                 l.colors[*k as usize] = KeyLight { rgb: c, mode: 1 };
             }
         } else {
             // The original only offers a colour in single-colour mode.
-            let l = &mut self.state.current_mut().lighting;
+            let l = &mut self.state.lighting_state_mut().lighting;
             l.rgb = c;
             if !MULTICOLOUR_ONLY.contains(&l.effect) {
                 l.color_mode = SINGLE_COLOUR;
@@ -747,12 +787,15 @@ impl App {
     }
 
     fn lighting(&mut self, ui: &mut Ui) {
+        if self.state.lighting_state().lighting.effect == 6 {
+            self.state.lighting_state_mut().lighting.color_mode = SINGLE_COLOUR;
+        }
         self.sync_side_lighting();
         w::panel(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.;
             w::toolbar(ui, 860., |ui, right| {
                 if right {
-                    let on = &mut self.state.current_mut().per_key_on;
+                    let on = &mut self.state.lighting_state_mut().per_key_on;
                     if w::button(ui, "Per-key paint", Kind::Seg(*on)).on_hover_text("Painted colours on top of the base effect").clicked() {
                         *on = true;
                     }
@@ -763,7 +806,7 @@ impl App {
                     self.quick(ui, &["All", "Alphas", "Numbers", "F-keys", "WASD", "Arrows", "Modifiers", "Clear"]);
                 }
             });
-            let l = self.state.current();
+            let l = self.state.lighting_state();
             // Keys without a per-key colour preview the base effect (in the app only).
             let (t, off) = (ui.input(|i| i.time) as f32, pal().surface2);
             if effects::animated(l.lighting.effect) {
@@ -784,11 +827,11 @@ impl App {
         });
         let r = w::row(ui, &[0., 360., 250.], 246.);
         let mut show_effect = false;
-        let (can_apply, mut apply_now) = (self.dirty(), false);
+        let (can_apply, mut apply_now) = (self.needs_apply(), false);
         w::place(ui, r[0], |ui| {
             w::card(ui, "Base effect", Some("Shown on keys without a per-key colour"), |ui| {
                 let (t, off) = (ui.input(|i| i.time) as f32, pal().surface2);
-                let l = &mut self.state.current_mut().lighting;
+                let l = &mut self.state.lighting_state_mut().lighting;
                 let shown = l.clone();
                 let name = EFFECTS.iter().find(|(_, v)| *v == l.effect).map_or("Unknown", |(n, _)| *n);
                 ui.horizontal(|ui| {
@@ -801,13 +844,18 @@ impl App {
                             for (name, v) in EFFECTS {
                                 let row = egui::RichText::new(format!("{}   {name}", effect_icon(*v))).size(14.);
                                 let resp = ui.selectable_label(l.effect == *v, row);
-                                // Each row previews its effect as it would be picked: multicolour, full brightness.
-                                let look = p::Lighting { effect: *v, color_mode: MULTICOLOUR, brightness: 100, ..shown.clone() };
+                                // Single Color previews the chosen RGB; other effects preview at full brightness.
+                                let look = p::Lighting { effect: *v, color_mode: if *v == 6 { SINGLE_COLOUR } else { MULTICOLOUR }, brightness: 100, ..shown.clone() };
                                 let thumb = egui::Rect::from_min_size(pos2(resp.rect.right() - 62., resp.rect.center().y - 9.), vec2(54., 18.));
                                 effects::thumb(ui.painter(), thumb, &look, t, pal().surface3);
                                 if resp.clicked() {
-                                    // Picking an effect shows it on the whole board, in multicolour.
-                                    (l.effect, l.color_mode) = (*v, MULTICOLOUR);
+                                    // Picking a base effect hides painted overrides.
+                                    l.effect = *v;
+                                    if *v == 6 {
+                                        l.color_mode = SINGLE_COLOUR;
+                                    } else if MULTICOLOUR_ONLY.contains(v) {
+                                        l.color_mode = MULTICOLOUR;
+                                    }
                                     show_effect = true;
                                 }
                             }
@@ -824,6 +872,7 @@ impl App {
                     ui.add_enabled_ui(!MULTICOLOUR_ONLY.contains(&l.effect), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.;
                         for (mode, label) in [(MULTICOLOUR, "Multicolour"), (SINGLE_COLOUR, "Single colour")] {
+                            if l.effect == 6 && mode == MULTICOLOUR { continue; }
                             if w::button(ui, label, Kind::Seg(l.color_mode == mode)).clicked() {
                                 l.color_mode = mode;
                             }
@@ -839,15 +888,15 @@ impl App {
             })
         });
         if show_effect {
-            self.state.current_mut().per_key_on = false;
+            self.state.lighting_state_mut().per_key_on = false;
         }
         if apply_now {
             self.apply();
         }
-        let per_key = self.state.current().per_key_on;
+        let per_key = self.state.lighting_state().per_key_on;
         w::place(ui, r[1], |ui| {
             w::card(ui, "Colour", Some("Paint colour for selected keys"), |ui| {
-                let target = if per_key { self.paint } else { self.state.current().lighting.rgb };
+                let target = if per_key { self.paint } else { self.state.lighting_state().lighting.rgb };
                 let mut pick = target;
                 let mut picked = false;
                 let mut erase = false;
@@ -878,14 +927,16 @@ impl App {
                     self.set_colour(pick);
                 }
                 if erase {
-                    let l = self.state.current_mut();
+                    let l = self.state.lighting_state_mut();
                     for k in &self.sel {
                         l.colors[*k as usize] = KeyLight::default();
                     }
                 }
-                let l = &mut self.state.current_mut().lighting;
+                let l = &mut self.state.lighting_state_mut().lighting;
                 w::slider_int(ui, "Brightness", &format!("{}%", l.brightness), &mut l.brightness, 0.0..=100., 1.);
-                w::slider_int(ui, "Speed", &format!("{}%", l.speed), &mut l.speed, 0.0..=100., 1.);
+                ui.add_enabled_ui(!matches!(l.effect, 6 | 8), |ui| {
+                    w::slider_int(ui, "Speed", &format!("{}%", l.speed), &mut l.speed, 0.0..=100., 1.);
+                });
             })
         });
         w::place(ui, r[2], |ui| {
@@ -893,7 +944,7 @@ impl App {
                 w::split(ui, "Follow keyboard", |ui| w::toggle(ui, &mut self.side_follow));
                 ui.add_enabled_ui(!self.side_follow, |ui| {
                     ui.spacing_mut().item_spacing.y = 16.;
-                    let l = self.state.current_mut();
+                    let l = self.state.lighting_state_mut();
                     let s = &mut l.side_lighting;
                     let recoloured = w::split(ui, "Colour", |ui| w::colour_button(ui, &mut s.rgb, 28., None)).changed();
                     w::slider_int(ui, "Brightness", &format!("{}%", s.brightness), &mut s.brightness, 0.0..=100., 1.);
@@ -1609,6 +1660,7 @@ mod tests {
         app.tx = tx;
         app.rx = rx;
         app.busy = false;
+        app.board_slot = Some((0, 0));
         (app, commands, events)
     }
     #[test]
@@ -1626,18 +1678,18 @@ mod tests {
     #[test]
     fn profile_selection_browses_saved_slots_without_writes_and_keeps_drafts() {
         let (mut app, commands, _) = app();
-        app.applied.profiles[1].layers[2].lighting.brightness = 23;
+        app.applied.profiles[1].layers[0].lighting.brightness = 23;
         app.state = app.applied.clone();
-        app.state.current_mut().lighting.brightness = 71;
+        app.state.lighting_state_mut().lighting.brightness = 71;
         app.select_slot(1, 2);
         assert!(commands.try_recv().is_err(), "browsing must never send a device command");
         assert!(!app.busy);
         assert_eq!((app.state.profile, app.state.layer), (1, 2));
-        assert_eq!(app.state.current().lighting.brightness, 23);
+        assert_eq!(app.state.lighting_state().lighting.brightness, 23);
         assert!(!app.dirty());
         assert_eq!((app.applied.profile, app.applied.layer), (0, 0));
         app.select_slot(0, 0);
-        assert_eq!(app.state.current().lighting.brightness, 71);
+        assert_eq!(app.state.lighting_state().lighting.brightness, 71);
         assert!(app.dirty(), "returning to a slot must preserve its unapplied draft");
         assert!(commands.try_recv().is_err());
     }
@@ -1646,21 +1698,21 @@ mod tests {
         let (mut app, commands, events) = app();
         app.select_slot(2, 1);
         assert!(commands.try_recv().is_err());
-        app.state.current_mut().lighting.brightness = 73;
+        app.state.lighting_state_mut().lighting.brightness = 73;
         app.apply();
         let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else {
             panic!("Apply must send the draft");
         };
         assert_eq!((saved.profile, saved.layer), (2, 1));
-        assert_eq!(saved.current().lighting.brightness, 73);
-        assert_eq!(reports[0][0], 7);
-        assert_eq!(reports[0][3], 15);
+        assert_eq!(saved.lighting_state().lighting.brightness, 73);
+        assert_eq!(&reports[0][..3], &[5, 2, 1]);
+        assert_eq!(reports.iter().find(|r| r[0] == 7).unwrap()[3], 15);
         assert_eq!(saved.profiles[0].layers[0].lighting.brightness, 50);
         events.send(Event::Error("test write failure".into())).unwrap();
         app.poll();
         assert_eq!((app.state.profile, app.state.layer), (2, 1));
-        assert_eq!(app.state.current().lighting.brightness, 73);
-        assert_eq!(app.applied.profiles[2].layers[1].lighting.brightness, 50);
+        assert_eq!(app.state.lighting_state().lighting.brightness, 73);
+        assert_eq!(app.applied.profiles[2].layers[0].lighting.brightness, 50);
         assert!(app.dirty());
     }
     #[test]
@@ -1802,8 +1854,8 @@ mod tests {
         let paint = app.paint;
         ui.swatch(&mut app, paint);
         assert!(
-            app.sel.iter().all(|k| app.state.current().colors[*k as usize].rgb == paint
-                && app.state.current().colors[*k as usize].mode == 1),
+            app.sel.iter().all(|k| app.state.lighting_state().colors[*k as usize].rgb == paint
+                && app.state.lighting_state().colors[*k as usize].mode == 1),
             "clicking the current paint colour must paint newly selected keys"
         );
     }
@@ -1829,7 +1881,7 @@ mod tests {
             })
             .max_by(|a, b| a.width().total_cmp(&b.width()))
             .unwrap();
-        let before = app.state.current().lighting.brightness;
+        let before = app.state.lighting_state().lighting.brightness;
         let target = pos2(rail.right() - 8., rail.center().y);
         ui.frame(
             &mut app,
@@ -1843,7 +1895,7 @@ mod tests {
                 },
             ],
         );
-        assert_eq!(app.state.current().lighting.brightness, 100);
+        assert_eq!(app.state.lighting_state().lighting.brightness, 100);
         assert_ne!(before, 100);
         ui.frame(
             &mut app,
@@ -1863,7 +1915,7 @@ mod tests {
             &reports[1][1..8],
             "side follow must match the main report on Ctrl+S while moving a slider"
         );
-        assert_eq!(state.unwrap().current().side_lighting.brightness, 100);
+        assert_eq!(state.unwrap().lighting_state().side_lighting.brightness, 100);
     }
     #[test]
     fn lighting_empty_paint_mode_switch_can_finish_apply() {
@@ -1899,7 +1951,7 @@ mod tests {
             self.click_at(app, rect.center());
         }
         fn side_colour(&mut self, app: &mut App) -> [u8; 3] {
-            let old = app.state.current().side_lighting.rgb;
+            let old = app.state.lighting_state().side_lighting.rgb;
             self.swatch(app, old);
             let square = self
                 .shapes
@@ -1914,7 +1966,7 @@ mod tests {
                 .expect("side colour picker");
             self.click_at(app, pos2(square.left() + square.width() * 0.5, square.top() + 10.));
             self.click_at(app, pos2(10., 1090.));
-            let rgb = app.state.current().side_lighting.rgb;
+            let rgb = app.state.lighting_state().side_lighting.rgb;
             assert_ne!(rgb, old);
             rgb
         }
@@ -1937,10 +1989,10 @@ mod tests {
     fn side_follow_clears_side_overrides_without_touching_key_paint() {
         let (mut app, commands, _) = app();
         app.side_follow = false;
-        app.state.current_mut().side_lighting.rgb = [10, 20, 30];
-        app.state.current_mut().colors[128..158].fill(KeyLight { rgb: [0, 0, 255], mode: 1 });
-        app.state.current_mut().colors[9] = KeyLight { rgb: [255, 0, 0], mode: 1 };
-        app.state.current_mut().colors[158] = KeyLight { rgb: [0, 255, 0], mode: 1 };
+        app.state.lighting_state_mut().side_lighting.rgb = [10, 20, 30];
+        app.state.lighting_state_mut().colors[128..158].fill(KeyLight { rgb: [0, 0, 255], mode: 1 });
+        app.state.lighting_state_mut().colors[9] = KeyLight { rgb: [255, 0, 0], mode: 1 };
+        app.state.lighting_state_mut().colors[158] = KeyLight { rgb: [0, 255, 0], mode: 1 };
         app.applied = app.state.clone();
         let mut ui = Probe::new(&mut app);
         ui.side_toggle(&mut app);
@@ -1949,10 +2001,10 @@ mod tests {
         let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else {
             panic!("apply follow")
         };
-        assert_eq!(saved.current().colors[9], KeyLight { rgb: [255, 0, 0], mode: 1 });
-        assert_eq!(saved.current().colors[158], KeyLight { rgb: [0, 255, 0], mode: 1 });
+        assert_eq!(saved.lighting_state().colors[9], KeyLight { rgb: [255, 0, 0], mode: 1 });
+        assert_eq!(saved.lighting_state().colors[158], KeyLight { rgb: [0, 255, 0], mode: 1 });
         assert!(
-            saved.current().shown_colors()[128..158].iter().all(|c| c.mode == 0),
+            saved.lighting_state().shown_colors()[128..158].iter().all(|c| c.mode == 0),
             "Follow keyboard must stop sending stale custom side overrides"
         );
         assert_eq!(reports.iter().filter(|r| r[0] == 81).count(), 3, "must send cleared side mode pages");
@@ -1987,9 +2039,9 @@ mod tests {
         let mut ui = Probe::new(&mut app);
         let rgb = ui.side_colour(&mut app);
         ui.click_text(&mut app, "Per-key paint");
-        assert!(app.state.current().per_key_on);
+        assert!(app.state.lighting_state().per_key_on);
         assert!(
-            app.state.current().shown_colors()[128..158].iter().all(|c| c.rgb == rgb),
+            app.state.lighting_state().shown_colors()[128..158].iter().all(|c| c.rgb == rgb),
             "the side swatch must agree with the restored side colour bytes"
         );
     }
@@ -2019,7 +2071,7 @@ mod tests {
             };
             assert_eq!((&bytes[i * 3..i * 3 + 3], modes[i]), (expected.0.as_slice(), expected.1), "LED {i}");
         }
-        assert_eq!(saved.current().side_lighting.rgb, rgb);
+        assert_eq!(saved.lighting_state().side_lighting.rgb, rgb);
     }
     #[test]
     fn erasing_selected_keys_keeps_other_keys_and_side_colours() {
@@ -2041,17 +2093,132 @@ mod tests {
         assert_eq!(modes[158], 0);
         assert_eq!(modes[14], 1);
         assert!(modes[128..158].iter().all(|m| *m == 1));
-        assert_eq!(saved.current().colors[14], KeyLight { rgb: [255, 0, 0], mode: 1 });
+        assert_eq!(saved.lighting_state().colors[14], KeyLight { rgb: [255, 0, 0], mode: 1 });
     }
     #[test]
     fn saved_independent_sides_do_not_become_linked_when_preset_values_match() {
         let (mut app, _, _) = app();
-        let rgb = app.state.current().lighting.rgb;
-        app.state.current_mut().colors[128..158].fill(KeyLight { rgb, mode: 1 });
+        let rgb = app.state.lighting_state().lighting.rgb;
+        app.state.lighting_state_mut().colors[128..158].fill(KeyLight { rgb, mode: 1 });
         app.sync_layer_ui();
         assert!(!app.side_follow, "an independent side colour must remain independent after loading");
-        app.state.current_mut().per_key_on = false;
+        app.state.lighting_state_mut().per_key_on = false;
         app.sync_layer_ui();
         assert!(!app.side_follow, "hidden remembered side paint must not become linked");
+    }
+    #[test]
+    fn saved_profile_can_be_applied_without_editing_it_first() {
+        let (mut app, commands, _) = app();
+        app.applied.profiles[1].layers[0].lighting.brightness = 23;
+        app.state = app.applied.clone();
+        app.select_slot(1, 0);
+        assert!(commands.try_recv().is_err(), "browsing is read-only");
+        let mut ui = Probe::new(&mut app);
+        ui.click_text(&mut app, "Apply to keyboard");
+        let Command::Write { reports, state: Some(saved) } =
+            commands.try_recv().expect("saved profile must be activatable with Apply")
+        else {
+            panic!("activation");
+        };
+        assert_eq!(&reports[0][..3], &[5, 1, 0]);
+        assert!(reports.iter().any(|r| r[0] == 29), "restore the saved actuation mode");
+        assert_eq!(reports.iter().find(|r| r[0] == 7).unwrap()[3], 5);
+        assert_eq!(saved.profile, 1);
+    }
+    #[test]
+    fn lighting_is_shared_by_function_layers_without_changing_layer_actuation() {
+        let (mut app, commands, _) = app();
+        app.state.profiles[0].layers[0].lighting.brightness = 23;
+        app.state.profiles[0].layers[2].actuation.press = 1.;
+        app.select_slot(0, 2);
+        let ui = Probe::new(&mut app);
+        assert!(ui.texts().iter().any(|(text, _)| text == "23%"), "Fn layers must show the same profile lighting");
+        assert_eq!(app.state.current().actuation.press, 1.);
+        app.select_slot(0, 0);
+        assert_eq!(app.state.current().actuation.press, 2.);
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
+    fn choosing_single_color_preserves_rgb_and_sends_custom_color_mode() {
+        let (mut app, commands, _) = app();
+        let l = app.state.current_mut();
+        l.per_key_on = false;
+        l.lighting.effect = 1;
+        l.lighting.color_mode = 9;
+        l.lighting.rgb = [12, 34, 56];
+        app.applied = app.state.clone();
+        let mut ui = Probe::new(&mut app);
+        ui.click_text(&mut app, "Wave #1");
+        ui.click_text(&mut app, "Single Color");
+        app.apply();
+        let Command::Write { reports, .. } = commands.try_recv().unwrap() else {
+            panic!("apply");
+        };
+        let main = reports.iter().find(|r| r[0] == 7).unwrap();
+        assert_eq!((main[1], main[4] & 15), (7, 9));
+        assert_eq!(&main[5..8], &[12, 34, 56]);
+    }
+    #[test]
+    fn profile_browsing_remembers_each_profiles_selected_layer_without_writing() {
+        let (mut app, commands, _) = app();
+        app.select_slot(0, 2);
+        app.select_profile(1);
+        assert_eq!((app.state.profile, app.state.layer), (1, 0));
+        app.select_slot(1, 1);
+        app.select_profile(0);
+        assert_eq!((app.state.profile, app.state.layer), (0, 2));
+        app.select_profile(1);
+        assert_eq!((app.state.profile, app.state.layer), (1, 1));
+        assert_eq!(app.board_slot, Some((0, 0)));
+        assert!(commands.try_recv().is_err());
+    }
+    #[test]
+    fn activation_uses_saved_settings_from_other_screens_not_their_drafts() {
+        let (mut app, commands, _) = app();
+        app.select_slot(1, 2);
+        app.state.current_mut().actuation.press = 1.7;
+        app.state.lighting_state_mut().lighting.brightness = 73;
+        app.apply();
+        let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else {
+            panic!("apply");
+        };
+        assert_eq!(&reports[0][..3], &[5, 1, 2]);
+        assert_eq!(saved.current().actuation.press, 2.);
+        assert_eq!(reports.iter().find(|r| r[0] == 26).unwrap()[8], 19);
+        assert_eq!(saved.lighting_state().lighting.brightness, 73);
+        assert_eq!(app.state.current().actuation.press, 1.7);
+    }
+    #[test]
+    fn layer_activation_restores_actuation_without_replacing_profile_lighting() {
+        let (mut app, commands, events) = app();
+        app.applied.profiles[0].layers[2].actuation.press = 1.3;
+        app.state = app.applied.clone();
+        app.screen = Screen::Keymap;
+        app.select_slot(0, 2);
+        app.apply();
+        let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else {
+            panic!("apply layer");
+        };
+        assert_eq!(reports.iter().map(|r| r[0]).collect::<Vec<_>>(), [5, 29, 26]);
+        assert_eq!(reports[2][1], 32);
+        assert_eq!(reports[2][8], 12);
+        assert_eq!(saved.profiles[0].selected_layer, 2);
+        events.send(Event::ActiveSlot { profile: 0, layer: 2 }).unwrap();
+        events.send(Event::Saved(saved)).unwrap();
+        events.send(Event::Done).unwrap();
+        app.poll();
+        assert_eq!(app.board_slot, Some((0, 2)));
+        assert!(!app.needs_apply());
+    }
+    #[test]
+    fn legacy_multicolour_single_color_is_corrected_as_an_unapplied_draft() {
+        let (mut app, commands, _) = app();
+        app.state.lighting_state_mut().lighting.color_mode = 8;
+        app.applied = app.state.clone();
+        let _ui = Probe::new(&mut app);
+        assert_eq!(app.state.lighting_state().lighting.color_mode, 9);
+        assert_eq!(app.applied.lighting_state().lighting.color_mode, 8);
+        assert!(app.dirty());
+        assert!(commands.try_recv().is_err());
     }
 }

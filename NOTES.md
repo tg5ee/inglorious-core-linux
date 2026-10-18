@@ -23,21 +23,42 @@ six screens provide all requested controls. Advanced editing is intentionally
 minimal: four numeric-keycode slots, DKS modes/point, mod-tap timeout, toggle type,
 and text macro events. It is not a graphical macro timeline editor.
 
-Profiles/layers are zero-based internally, 1–3 in the Device UI and CLI. The
-worker selects the saved target profile/layer before un-indexed setting writes.
-Sidebar profile/layer selection only browses local saved settings/drafts; it sends
-no device command and does not persist a selection. CLI `profile` still explicitly
-switches the board with 0x05. Apply selects its edited target before writing.
-Explicit Re-apply everything restores local settings, beginning with 0x05 →
-0x1D Custom → global/per-key 0x1A → main/side preset → all colour/mode pages.
+Profiles/layers are zero-based internally, 1–3 in the UI and CLI. Comparison with
+`DeviceProfileState`, `DeviceProfileLayerState`, `GMMK3HEDeviceHandler.setActiveProfile`
+and `setActiveLayer` in the archived app established that lighting and per-key RGB
+belong to the profile, while bindings and actuation belong to its layers. The
+working extracted main/renderer files were checked byte-for-byte against the ASAR.
+
+For saved-file compatibility, profile lighting uses `profiles[p].layers[0]` through
+`lighting_state()` / `lighting_state_mut()`. Old Fn/Fn2 lighting fields remain in
+the serialized file unchanged and are not used as independent lighting settings.
+`selected_layer` remembers each profile's editor layer, with a default for old files.
+Saved state is still backed up before replacement; browsing itself saves nothing.
+
+Sidebar profile/layer selection browses saved settings/drafts without sending a
+device command. The UI distinguishes the edited slot from the keyboard's last
+confirmed active slot. Apply is enabled for a pending activation even without edits.
+On profile activation, Apply sends 0x05 → 0x1D Custom → saved global/per-key 0x1A →
+profile preset/side lighting → all colour/mode pages. On layer activation within the
+same profile, only 0x05 and that layer's actuation restoration are needed before
+the requested edits. Unrelated screen drafts are excluded from the saved state
+used for activation. Successful write events update the confirmed slot; an error
+marks it unknown while preserving the editor selection and drafts.
+
+The worker selects the saved target before other un-indexed writes. Explicit
+Re-apply everything uses the same profile restoration then performance/key writes.
 Preset-only restoration sends zero mode bytes to clear old overrides. Switching
-paint mode also sends the desired pages even when no keys are painted, so Apply
-can save the mode change. Linked side-light settings synchronize before Apply,
-clearing only the side override modes so custom key and badge colours survive.
-An independent side-colour edit selects the Single Color/custom RGB preset and
-updates remembered side LED colours even while per-key paint is off. Saved side
-overrides keep the side lights independent when their preset matches the main one.
-CLI `effect` first reads the actual active slot.
+paint mode sends desired pages even without painted keys so Apply saves the change.
+Linked sides synchronize before Apply, clearing only side override modes. An
+independent side edit selects Single Color/custom RGB and updates remembered side
+colours while paint is off. Side overrides retain independence across reloads.
+
+The effect picker no longer forces every effect into multicolour. Single Color
+selects custom RGB (9); forced-multicolour effects select RGB (8); other effects
+retain the chosen colour mode. Existing Single Color/multicolour values become
+unapplied solid-colour drafts on the Lighting screen. Its speed control is disabled,
+as in the original renderer. CLI `effect` reads the active slot and applies its
+profile-wide lighting; CLI `profile` explicitly switches the board.
 
 Startup performs no automatic writes. The worker opens hardware only on a
 command. It filters 342d:e3de by usage_page 0xFFFF, rejects zero/multiple matching
@@ -184,8 +205,8 @@ confirmation; calibration never advances itself. Neither is exposed by the CLI.
   Per-key painting writes the entire 168-entry array, including zeros for
   unpainted positions. A partial batch cannot be rolled back automatically.
 - External profile changes (keyboard hotkeys/another application) are not
-  subscribed to; explicit Device reads resynchronize the editor selection. Apply selects
-  its local target. Concurrent app instances are unsupported; use one writer.
+  subscribed to; Ctrl+R/Device reads refresh the last confirmed slot and editor
+  selection. Apply selects its local target. Concurrent writers are unsupported.
 - State JSON is backed up and replaced only after successful report sends.
   Send success is not firmware acceptance or power-cycle persistence proof.
   Backups accumulate. Corrupt state files are refused and preserved, not reset.

@@ -76,15 +76,17 @@ fn dry_worker_progress_and_state() {
     let (tx, rx, join) = worker(true);
     tx.send(Work::Write {
         reports: vec![protocol::set_sleep(60)],
-        state: Some(Box::new(State::default())),
+        state: Some(Box::new(State {profile:2, layer:1, ..State::default()})),
     })
     .unwrap();
     let mut progress = Vec::new();
     let mut saved = false;
+    let mut active = None;
     loop {
         match rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap() {
             Event::Progress(i, n) => progress.push((i, n)),
             Event::Saved(_) => saved = true,
+            Event::ActiveSlot {profile, layer} => active = Some((profile, layer)),
             Event::Done => break,
             Event::Error(e) => panic!("{e}"),
             _ => {}
@@ -92,6 +94,7 @@ fn dry_worker_progress_and_state() {
     }
     assert_eq!(progress, [(1, 2), (2, 2)]);
     assert!(saved);
+    assert_eq!(active, Some((2, 1)));
     tx.send(Work::Shutdown).unwrap();
     join.join().unwrap();
 }
