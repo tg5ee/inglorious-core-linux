@@ -11,6 +11,10 @@ the official app talks to the board; see [NOTES.md](NOTES.md).
 
 ![Lighting screen with the Ripple Graff effect preview running](demo.gif)
 
+On the desktop, following the Omarchy "Trees" theme (Glorious Mode preview):
+
+![Inglorious Core Linux on an Omarchy desktop with the Trees theme](demo-omarchy.gif)
+
 ## What works
 
 Tested on a real board: reading the device, lighting presets, per-key RGB, global
