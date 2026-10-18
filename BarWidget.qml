@@ -10,7 +10,7 @@ BarWidget {
     moduleName: "io.github.tg5ee.inglorious-core-linux"
 
     // nf-md-keyboard (U+F030C), drawn in the bar's Nerd Font so it follows the theme.
-    readonly property string glyph: "C"
+    readonly property string glyph: String.fromCodePoint(0xF030C)
     // Hyprland's dispatch parses Lua here, so focus goes through hl.dsp.focus like Omarchy's own helpers.
     readonly property string openCmd: "app=\"$HOME/.local/bin/inglorious-core\"; "
         + "if hyprctl clients -j | jq -e 'any(.[]; .class == \"inglorious-core\")' >/dev/null; then "
