@@ -104,13 +104,24 @@ impl Transport {
     pub fn live(&self) -> Result<Option<f32>> {
         match self {
             Self::DryRun => Ok(None),
-            Self::Hardware { events, .. } => {
-                let mut r = [0; 65];
-                let n = events.read_timeout(&mut r, 0)?;
-                Ok(p::parse_visualization(&r[..n]))
-            }
+            Self::Hardware { events, .. } => latest_travel(|r| Ok(events.read_timeout(r, 0)?)),
         }
     }
+}
+fn latest_travel(mut read: impl FnMut(&mut [u8]) -> Result<usize>) -> Result<Option<f32>> {
+    let mut r = [0; 65];
+    let mut latest = None;
+    // Catch up to current travel without letting continuous input starve commands.
+    for _ in 0..256 {
+        let n = read(&mut r)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(value) = p::parse_visualization(&r[..n]) {
+            latest = Some(value);
+        }
+    }
+    Ok(latest)
 }
 pub fn state_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
@@ -245,6 +256,9 @@ fn worker_with_open(
                                 let _ = et.send(info(t)?);
                             }
                             Command::Live(enabled) => {
+                                if enabled {
+                                    t.live()?; // Discard packets left over from a previous live session.
+                                }
                                 t.send(&p::visualization(enabled))?;
                                 live = enabled;
                             }
@@ -417,6 +431,34 @@ pub fn cli(dry: bool, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_read_uses_newest_sample_and_skips_other_reports() {
+        use std::collections::VecDeque;
+        let mut reports = VecDeque::from([
+            vec![5, 27, 0], vec![5, 27, 40], vec![5, 1, 2, 0],
+            vec![5, 27, 0], vec![5, 27, 30], vec![5, 208, 9],
+        ]);
+        let read = |out: &mut [u8]| -> Result<usize> {
+            let Some(r) = reports.pop_front() else { return Ok(0); };
+            out[..r.len()].copy_from_slice(&r);
+            Ok(r.len())
+        };
+        assert_eq!(latest_travel(read).unwrap(), Some(0.75));
+        assert!(reports.is_empty());
+        assert_eq!(latest_travel(|_| Ok(0)).unwrap(), None);
+    }
+    #[test]
+    fn live_read_is_bounded_and_keeps_read_errors() {
+        let mut reads = 0;
+        let value = latest_travel(|out| {
+            reads += 1;
+            out[..3].copy_from_slice(&[5, 27, 20]);
+            Ok(3)
+        }).unwrap();
+        assert_eq!(value, Some(0.5));
+        assert_eq!(reads, 256, "continuous input must not starve worker commands");
+        assert!(latest_travel(|_| anyhow::bail!("device disconnected")).is_err());
+    }
     #[test]
     fn worker_reopens_after_error_without_replaying_write() {
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};

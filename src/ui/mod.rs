@@ -460,7 +460,8 @@ impl App {
                     }
                 }
                 Event::Saved(s) => self.applied = *s,
-                Event::Live(v) => self.travel = v,
+                Event::Live(v) if self.live => self.travel = v,
+                Event::Live(_) => {}
                 Event::Done => {
                     self.busy = false;
                     if let Some(stage) = self.pending_calibration.take() {
@@ -1002,6 +1003,7 @@ impl App {
                 let mut live = self.live;
                 if w::split(ui, "Live view", |ui| w::toggle(ui, &mut live)).changed() {
                     self.live = live;
+                    self.travel = 0.;
                     self.send(Command::Live(live));
                 }
             })
@@ -1602,6 +1604,18 @@ mod tests {
         app.rx = rx;
         app.busy = false;
         (app, commands, events)
+    }
+    #[test]
+    fn live_samples_after_switching_off_do_not_move_the_gauge() {
+        let (mut app, _, events) = app();
+        app.live = true;
+        events.send(Event::Live(0.75)).unwrap();
+        app.poll();
+        assert_eq!(app.travel, 0.75);
+        app.live = false;
+        events.send(Event::Live(0.25)).unwrap();
+        app.poll();
+        assert_eq!(app.travel, 0.75, "ignore samples queued before live view was disabled");
     }
     #[test]
     fn profile_selection_browses_saved_slots_without_writes_and_keeps_drafts() {

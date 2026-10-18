@@ -41,6 +41,10 @@ interfaces, and never selects by interface index. It uses feature reports with
 65 bytes [0, 64 command bytes], requires a full 65-byte feature response, removes
 the leading byte and validates the echoed command. Live reads are zero-timeout
 interrupt reads on the same handle, recognize [5,27,value], and clamp at 40.
+Each worker poll drains up to 256 queued reports and publishes only the newest
+travel sample, rather than replaying one old report every 20 ms. Non-travel
+reports do not replace the last travel sample. Enabling live view discards old
+queued samples first; the UI ignores late samples after it is switched off.
 
 `SEND_WAIT=550 ms`, `GET_WAIT=150 ms`, `KEYSTROKE_WAIT=650 ms`, and
 `COLOR_START_WAIT=750 ms` are in device.rs. The source uses shorter per-page RGB
