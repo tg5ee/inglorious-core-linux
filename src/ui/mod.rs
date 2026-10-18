@@ -282,6 +282,8 @@ pub struct App {
     paint: [u8; 3],
     paint_palette: bool,
     side_follow: bool,
+    /// Base effect colour follows the Omarchy accent (the theme-set hook is installed).
+    theme_sync: bool,
     per_key_scope: bool,
     live: bool,
     travel: f32,
@@ -341,6 +343,8 @@ impl App {
             paint: SWATCHES[0],
             paint_palette: false,
             side_follow: false,
+            // Dry runs (and the tests) leave the real hook alone.
+            theme_sync: !dry && device::theme_sync_hook().is_ok_and(|h| h.exists()),
             per_key_scope: false,
             live: false,
             travel: 0.,
@@ -363,8 +367,37 @@ impl App {
             theme_rx,
             dialog: None,
         };
+        // Rewrite the hook so it points at this binary even after a reinstall elsewhere.
+        if app.theme_sync && !dry && let Err(e) = device::set_theme_sync(true) {
+            app.notice = Some((format!("Could not update the theme sync hook: {e}"), true));
+        }
+        app.follow_theme();
         app.sync_layer_ui();
         app
+    }
+    /// The hook already wrote the board and the saved file; bring this window's copies in line.
+    fn follow_theme(&mut self) {
+        if let (true, Some(rgb)) = (self.theme_sync, self.theme.accent) {
+            self.state.follow_theme(rgb);
+            self.applied.follow_theme(rgb);
+        }
+    }
+    fn set_theme_sync(&mut self, on: bool) {
+        if !self.dry && let Err(e) = device::set_theme_sync(on) {
+            self.notice = Some((format!("Could not {} theme sync: {e}", if on { "turn on" } else { "turn off" }), true));
+            return;
+        }
+        self.theme_sync = on;
+        let Some(rgb) = self.theme.accent.filter(|_| on) else { return };
+        // Turning it on applies the accent now, like a theme switch would.
+        let mut s = self.applied.clone();
+        (s.profile, s.layer) = (self.state.profile, self.state.layer);
+        self.state.follow_theme(rgb);
+        if s.follow_theme(rgb) {
+            let l = s.lighting_state();
+            let r = p::lighting(&l.lighting, false).and_then(|a| Ok(vec![a, p::lighting(&l.side_lighting, true)?]));
+            self.write(r, Some(s));
+        }
     }
     /// Lighting mode and side-light link follow whatever the selected layer holds.
     fn sync_layer_ui(&mut self) {
@@ -793,6 +826,10 @@ impl App {
         if self.state.lighting_state().lighting.effect == 6 {
             self.state.lighting_state_mut().lighting.color_mode = SINGLE_COLOUR;
         }
+        // A newly picked effect takes the theme colour too.
+        if let (true, Some(rgb)) = (self.theme_sync, self.theme.accent) {
+            self.state.lighting_state_mut().follow_theme(rgb);
+        }
         self.sync_side_lighting();
         w::panel(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.;
@@ -832,7 +869,7 @@ impl App {
         });
         let r = w::row(ui, &[0., 360., 250.], 246.);
         let mut show_effect = false;
-        let (can_apply, mut apply_now) = (self.needs_apply(), false);
+        let (can_apply, mut apply_now, theme_sync) = (self.needs_apply(), false, self.theme_sync);
         w::place(ui, r[0], |ui| {
             w::card(ui, "Base effect", Some("Shown on keys without a per-key colour"), |ui| {
                 let (t, off) = (ui.input(|i| i.time) as f32, pal().surface2);
@@ -874,7 +911,7 @@ impl App {
                 let apply_button = |ui: &mut Ui| ui.add_enabled_ui(can_apply, |ui| w::button(ui, "Apply", Kind::Primary)).inner.on_hover_text("Ctrl+S").clicked();
                 let narrow = ui.available_width() < 320.;
                 ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!MULTICOLOUR_ONLY.contains(&l.effect), |ui| {
+                    ui.add_enabled_ui(!MULTICOLOUR_ONLY.contains(&l.effect) && !theme_sync, |ui| {
                         ui.spacing_mut().item_spacing.x = 6.;
                         for (mode, label) in [(MULTICOLOUR, "Multicolour"), (SINGLE_COLOUR, "Single colour")] {
                             if l.effect == 6 && mode == MULTICOLOUR { continue; }
@@ -912,13 +949,26 @@ impl App {
                     }
                 });
                 let per_key = self.paint_palette;
-                ui.label(if per_key { "Paint colour for selected keys" } else { "Base effect colour" });
+                let mut sync = self.theme_sync;
+                if per_key {
+                    ui.label("Paint colour for selected keys");
+                } else {
+                    let tip = "The base effect takes the Omarchy theme accent on every theme switch, also while the app is closed. Effects with firmware colours are left alone.";
+                    w::split(ui, "Base effect colour", |ui| {
+                        ui.add_enabled_ui(self.theme.accent.is_some() || sync, |ui| w::toggle(ui, &mut sync))
+                            .response
+                            .on_hover_text(tip)
+                            .on_disabled_hover_text("No accent colour in the current Omarchy theme");
+                        w::text(ui, "Follow theme", w::body(13.), pal().muted);
+                    });
+                }
+                let locked = sync && !per_key;
                 let target = if per_key { self.paint } else { self.state.lighting_state().lighting.rgb };
                 let mut pick = target;
                 let mut picked = false;
                 let mut erase = false;
                 let theme_rgb = self.theme.keyboard;
-                ui.horizontal(|ui| {
+                ui.add_enabled_ui(!locked, |ui| ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.;
                     let n = SWATCHES.len() + 1 + usize::from(per_key) + usize::from(theme_rgb.is_some());
                     let size = ((ui.available_width() + 6.) / n as f32 - 6.).clamp(20., 28.);
@@ -939,7 +989,10 @@ impl App {
                     if per_key {
                         erase = w::no_colour(ui, size).on_hover_text("Remove colour: selected keys show the base effect").clicked();
                     }
-                });
+                }));
+                if sync != self.theme_sync {
+                    self.set_theme_sync(sync);
+                }
                 if picked {
                     self.set_colour(pick);
                 }
@@ -1623,6 +1676,7 @@ impl eframe::App for App {
         while let Ok(t) = self.theme_rx.try_recv() {
             theme::apply(ctx, t.palette(self.colours));
             self.theme = t;
+            self.follow_theme();
         }
         self.poll_dialog();
         self.shortcuts(ctx);
@@ -1667,6 +1721,23 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn theme_sync_on_sends_the_accent_once_and_locks_the_base_colour() {
+        let (mut app, commands, _) = app();
+        app.theme.accent = Some([0x45, 0x8f, 0x82]);
+        let l = app.state.lighting_state_mut();
+        l.lighting.effect = 1;
+        l.side_lighting = l.lighting.clone(); // side lights follow the keyboard
+        app.applied = app.state.clone();
+        app.set_theme_sync(true);
+        let Command::Write { reports, state: Some(saved) } = commands.try_recv().unwrap() else { panic!("sync write") };
+        assert_eq!(reports.iter().map(|r| (r[0], r[4], r[5..8].to_vec())).collect::<Vec<_>>(), [(7, SINGLE_COLOUR, vec![0x45, 0x8f, 0x82]), (8, SINGLE_COLOUR, vec![0x45, 0x8f, 0x82])]);
+        assert_eq!(saved.lighting_state().lighting.rgb, [0x45, 0x8f, 0x82]);
+        // Picking Multicolour afterwards snaps back to the theme colour.
+        app.state.lighting_state_mut().lighting.color_mode = MULTICOLOUR;
+        Probe::new(&mut app);
+        assert_eq!(app.state.lighting_state().lighting.color_mode, SINGLE_COLOUR);
+    }
     fn app() -> (App, Receiver<Command>, Sender<Event>) {
         let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
         let mut app = App::new(&cc, State::default(), true);

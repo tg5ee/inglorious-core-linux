@@ -16,6 +16,19 @@ pub struct Layer {
     pub advanced: BTreeMap<u8, Advanced>,
 }
 impl Layer {
+    /// Theme sync: the base effect takes `rgb` in single-colour mode, and side lights that follow
+    /// the keyboard come along. Effects whose colours the firmware owns are left alone.
+    pub fn follow_theme(&mut self, rgb: [u8; 3]) -> bool {
+        if crate::tables::MULTICOLOUR_ONLY.contains(&self.lighting.effect) {
+            return false;
+        }
+        let (old, side) = (self.lighting.clone(), self.side_lighting == self.lighting);
+        (self.lighting.rgb, self.lighting.color_mode) = (rgb, crate::tables::SINGLE_COLOUR);
+        if side {
+            self.side_lighting = self.lighting.clone();
+        }
+        self.lighting != old
+    }
     /// The per-key array as the board should show it.
     pub fn shown_colors(&self) -> Vec<KeyLight> {
         let mut c = self.colors.clone();
@@ -151,6 +164,10 @@ impl State {
         }
         Ok(())
     }
+    /// `Layer::follow_theme` on every profile's lighting; true when any of them changed.
+    pub fn follow_theme(&mut self, rgb: [u8; 3]) -> bool {
+        self.profiles.iter_mut().fold(false, |changed, p| p.layers[0].follow_theme(rgb) | changed)
+    }
     /// CORE stores lighting per profile. Keep the base-layer storage for file compatibility.
     pub fn lighting_state(&self) -> &Layer {
         &self.profiles[self.profile as usize].layers[0]
@@ -284,9 +301,35 @@ pub fn key_changes(new: &State, old: &State) -> Result<Vec<crate::protocol::Repo
     }
     Ok(r)
 }
+/// `accent = "#rrggbb"` from an Omarchy v4 colors.toml.
+pub fn theme_accent(colors_toml: &str) -> Option<[u8; 3]> {
+    let v = colors_toml.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        (k.trim() == "accent").then(|| v.trim().trim_matches('"').trim_start_matches('#').to_owned())
+    })?;
+    let byte = |i: usize| u8::from_str_radix(v.get(i..i + 2)?, 16).ok();
+    (v.len() == 6).then_some([byte(0)?, byte(2)?, byte(4)?])
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn theme_sync_recolours_colour_effects_only() {
+        assert_eq!(theme_accent("mode = \"dark\"\naccent = \"#458f82\"\n"), Some([0x45, 0x8f, 0x82]));
+        assert_eq!(theme_accent("accent = \"#45\""), None);
+        let mut s = State::default();
+        s.profiles[0].layers[0].lighting.color_mode = crate::tables::MULTICOLOUR;
+        s.profiles[0].layers[0].side_lighting = s.profiles[0].layers[0].lighting.clone();
+        s.profiles[1].layers[0].lighting.effect = 0; // Glorious Mode: firmware colours
+        s.profiles[2].layers[0].side_lighting.rgb = [255, 0, 0]; // independent side lights
+        assert!(s.follow_theme([1, 2, 3]));
+        let l = &s.profiles[0].layers[0];
+        assert_eq!((l.lighting.rgb, l.lighting.color_mode), ([1, 2, 3], crate::tables::SINGLE_COLOUR));
+        assert_eq!(l.side_lighting, l.lighting);
+        assert_eq!(s.profiles[1].layers[0].lighting.rgb, Lighting::default().rgb);
+        assert_eq!(s.profiles[2].layers[0].side_lighting.rgb, [255, 0, 0]);
+        assert!(!s.follow_theme([1, 2, 3]), "same accent again changes nothing");
+    }
     #[test]
     fn profile_lighting_is_layer_independent_and_preserves_legacy_layer_data() {
         let mut s = State::default();

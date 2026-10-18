@@ -123,6 +123,38 @@ fn latest_travel(mut read: impl FnMut(&mut [u8]) -> Result<usize>) -> Result<Opt
     }
     Ok(latest)
 }
+/// Omarchy runs every script in theme-set.d on a theme switch; this one is theme sync's on switch.
+pub fn theme_sync_hook() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("cannot determine configuration directory")?
+        .join("omarchy/hooks/theme-set.d/inglorious-rgb-sync"))
+}
+/// Installs (with this binary's current path) or removes the theme-set hook.
+pub fn set_theme_sync(on: bool) -> Result<()> {
+    let hook = theme_sync_hook()?;
+    if !on {
+        return match std::fs::remove_file(&hook) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let exe = std::env::current_exe()?.to_string_lossy().replace('\'', r"'\''");
+    std::fs::create_dir_all(hook.parent().unwrap())?;
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/bash\n# Inglorious Core theme sync: turn it off in the app (Lighting > Colour) to remove this file.\n\
+             # Backgrounded so the theme switch never waits on the keyboard.\n\
+             [ -x '{exe}' ] && setsid -f '{exe}' theme-sync >/dev/null 2>&1 </dev/null\nexit 0\n"
+        ),
+    )?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+pub fn theme_colors_path() -> Option<PathBuf> {
+    Some(dirs::state_dir()?.join("omarchy/current/theme/colors.toml"))
+}
 pub fn state_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("cannot determine configuration directory")?
@@ -432,8 +464,34 @@ pub fn cli(dry: bool, args: &[String]) -> Result<()> {
                 save_state(&s)?;
             }
         }
+        // Run by the theme-set hook: the new accent into every profile's base effect, one preset
+        // write for the active profile only when it changed.
+        Some("theme-sync") if args.len() == 1 => {
+            let path = theme_colors_path().context("cannot determine state directory")?;
+            let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+            let rgb = crate::state::theme_accent(&text).with_context(|| format!("no accent in {}", path.display()))?;
+            // Theme switches can come in bursts: one writer at a time, each reading the newest theme.
+            let lock = std::fs::File::create(std::env::temp_dir().join("inglorious-theme-sync.lock"))?;
+            lock.lock()?;
+            let mut s = load_state()?;
+            (s.profile, s.layer) = p::parse_profile(&t.query(&p::get_profile())?)?;
+            let before = s.lighting_state().clone();
+            if !s.follow_theme(rgb) {
+                return Ok(());
+            }
+            let l = s.lighting_state();
+            if l.lighting != before.lighting {
+                t.send(&p::lighting(&l.lighting, false)?)?;
+            }
+            if l.side_lighting != before.side_lighting {
+                t.send(&p::lighting(&l.side_lighting, true)?)?;
+            }
+            if !dry {
+                save_state(&s)?;
+            }
+        }
         _ => bail!(
-            "usage: inglorious-core [--dry-run] [info | profile <1..3> | effect <0..18> [speed%] [brightness%] [RRGGBB] | perkey KEY=RRGGBB... | actuation <mm> [rt_press_mm rt_release_mm]]"
+            "usage: inglorious-core [--dry-run] [info | profile <1..3> | effect <0..18> [speed%] [brightness%] [RRGGBB] | perkey KEY=RRGGBB... | actuation <mm> [rt_press_mm rt_release_mm] | theme-sync]"
         ),
     };
     Ok(())

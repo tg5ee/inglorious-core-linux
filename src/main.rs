@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
     args.retain(|a| a != "--dry-run");
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "inglorious-core [--dry-run] [info | profile <1..3> | effect <0..18> [speed%] [brightness%] [RRGGBB]]\nWith no subcommand, opens the GUI. GLORIOUS_CORE_DRY_RUN=1 also prevents hardware access."
+            "inglorious-core [--dry-run] [info | profile <1..3> | effect <0..18> [speed%] [brightness%] [RRGGBB] | theme-sync]\nWith no subcommand, opens the GUI. GLORIOUS_CORE_DRY_RUN=1 also prevents hardware access."
         );
         return Ok(());
     }

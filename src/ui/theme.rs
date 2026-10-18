@@ -76,15 +76,19 @@ pub struct Theme {
     pub name: Option<String>,
     /// `keyboard.rgb`: the colour the theme suggests for keyboard backlights.
     pub keyboard: Option<[u8; 3]>,
+    /// `accent` from colors.toml: what theme sync puts on the keyboard.
+    pub accent: Option<[u8; 3]>,
 }
 impl Theme {
     pub fn load() -> Self {
         let dir = theme_dir();
         let read = |f: &str| dir.as_ref().and_then(|d| std::fs::read_to_string(d.join(f)).ok());
-        let palette = read("colors.toml").and_then(|t| parse_colors(&t));
+        let colors = read("colors.toml");
+        let palette = colors.as_deref().and_then(parse_colors);
+        let accent = colors.as_deref().and_then(glorious_core_rs::state::theme_accent);
         let keyboard = read("keyboard.rgb").and_then(|t| hex(t.trim())).map(|c| [c.r(), c.g(), c.b()]);
         let name = dir.and_then(|d| std::fs::read_to_string(d.with_file_name("theme.name")).ok()).map(|n| title(n.trim()));
-        Self { palette, name, keyboard }
+        Self { palette, name, keyboard, accent }
     }
     /// Palette for the chosen colours; Omarchy falls back to amber when no theme is present.
     pub fn palette(&self, colours: Colours) -> Palette {
@@ -275,10 +279,10 @@ mod tests {
     }
     #[test]
     fn colour_choice_only_swaps_the_palette() {
-        let theme = Theme { palette: parse_colors(TREES), name: Some("Trees".into()), keyboard: Some([0x45, 0x8f, 0x82]) };
+        let theme = Theme { palette: parse_colors(TREES), name: Some("Trees".into()), keyboard: Some([0x45, 0x8f, 0x82]), accent: None };
         assert_eq!(theme.palette(Colours::Amber), Palette::figma());
         assert_eq!(theme.palette(Colours::Omarchy), parse_colors(TREES).unwrap());
-        let none = Theme { palette: None, name: None, keyboard: None };
+        let none = Theme { palette: None, name: None, keyboard: None, accent: None };
         assert_eq!(none.palette(Colours::Omarchy), Palette::figma());
         assert_eq!((Colours::parse("amber\n"), Colours::parse("omarchy"), Colours::parse("")), (Colours::Amber, Colours::Omarchy, Colours::Omarchy));
     }
