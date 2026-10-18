@@ -1,0 +1,2 @@
+# Access for the logged-in local seat; no global 0666 permissions.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="342d", TAG+="uaccess"

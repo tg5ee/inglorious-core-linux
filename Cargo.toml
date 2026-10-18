@@ -1,0 +1,20 @@
+[package]
+name = "inglorious-core"
+version = "0.1.0"
+edition = "2024"
+description = "Inglorious Core Linux: unofficial configurator for the Glorious GMMK 3 HE 75%"
+license = "MIT"
+
+# The library keeps its original name so the code and tests need no churn.
+[lib]
+name = "glorious_core_rs"
+
+[dependencies]
+anyhow = "1"
+hidapi = { version = "2", default-features = false, features = ["linux-native"] }
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png"] }
+egui-phosphor = "0.11"

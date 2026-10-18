@@ -1,0 +1,1573 @@
+//! Six-screen GUI from the Figma redesign (file j70ge8ICVlsLKIjCpWPGy2, page "Screens"),
+//! coloured by the active Omarchy theme and laid out for Hyprland tiles of any size.
+mod effects;
+mod theme;
+mod widgets;
+use eframe::egui::{self, Align, Color32, Layout, Sense, Ui, pos2, vec2};
+use glorious_core_rs::{
+    device::{self, Command, Event},
+    protocol::{self as p, KeyLight, MacroEvent},
+    state::{self, Advanced, State},
+    tables::{EFFECTS, KEYCODES, MULTICOLOUR, MULTICOLOUR_ONLY, SINGLE_COLOUR},
+};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::mpsc::{self, Receiver, Sender},
+};
+use theme::{Colours, Theme, pal};
+use widgets::{self as w, KeyLook, Kind};
+
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Lighting,
+    Actuation,
+    Keymap,
+    Advanced,
+    Performance,
+    Device,
+}
+const SCREENS: [(Screen, &str, &str); 6] = {
+    use egui_phosphor::regular as i;
+    [
+        (Screen::Lighting, "Lighting", i::PALETTE),
+        (Screen::Actuation, "Actuation", i::SLIDERS_HORIZONTAL),
+        (Screen::Keymap, "Keymap", i::KEYBOARD),
+        (Screen::Advanced, "Advanced keys", i::MAGIC_WAND),
+        (Screen::Performance, "Performance", i::GAUGE),
+        (Screen::Device, "Device", i::CPU),
+    ]
+};
+/// Independently applied slices of the state; a screen is "unsaved" when its parts differ.
+#[derive(Clone, Copy)]
+enum Part {
+    Preset,
+    PerKey,
+    Actuation,
+    Keys,
+    Performance,
+}
+impl Screen {
+    fn parts(self) -> &'static [Part] {
+        match self {
+            Screen::Lighting => &[Part::Preset, Part::PerKey],
+            Screen::Actuation => &[Part::Actuation],
+            Screen::Keymap | Screen::Advanced => &[Part::Keys],
+            Screen::Performance => &[Part::Performance],
+            Screen::Device => &[],
+        }
+    }
+}
+fn copy(part: Part, pi: usize, li: usize, from: &State, to: &mut State) {
+    let (a, b) = (&from.profiles[pi], &mut to.profiles[pi]);
+    let (la, lb) = (&a.layers[li], &mut b.layers[li]);
+    match part {
+        Part::Preset => {
+            lb.lighting = la.lighting.clone();
+            lb.side_lighting = la.side_lighting.clone();
+        }
+        Part::PerKey => (lb.colors, lb.per_key_on) = (la.colors.clone(), la.per_key_on),
+        Part::Actuation => {
+            lb.actuation = la.actuation.clone();
+            lb.per_key = la.per_key.clone();
+        }
+        Part::Keys => {
+            lb.bindings = la.bindings.clone();
+            lb.advanced = la.advanced.clone();
+        }
+        Part::Performance => (b.polling, b.debounce, b.sleep) = (a.polling, a.debounce, a.sleep),
+    }
+}
+fn same(part: Part, pi: usize, li: usize, x: &State, y: &State) -> bool {
+    let (a, b) = (&x.profiles[pi], &y.profiles[pi]);
+    let (la, lb) = (&a.layers[li], &b.layers[li]);
+    match part {
+        Part::Preset => la.lighting == lb.lighting && la.side_lighting == lb.side_lighting,
+        Part::PerKey => la.colors == lb.colors && la.per_key_on == lb.per_key_on,
+        Part::Actuation => la.actuation == lb.actuation && la.per_key == lb.per_key,
+        Part::Keys => la.bindings == lb.bindings && la.advanced == lb.advanced,
+        Part::Performance => (a.polling, a.debounce, a.sleep) == (b.polling, b.debounce, b.sleep),
+    }
+}
+
+const LAYERS: [&str; 3] = ["Base", "Fn 1", "Fn 2"];
+const SWATCHES: [[u8; 3]; 7] = [
+    [0x1f, 0x4f, 0xff],
+    [0x7b, 0x2f, 0xf7],
+    [0x00, 0xc8, 0x53],
+    [0xe5, 0x39, 0x35],
+    [0xf5, 0xa4, 0x3a],
+    [0xff, 0xff, 0xff],
+    [0x00, 0xe5, 0xff],
+];
+const RATES: [u16; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
+const STAGES: [&str; 4] = ["1st press", "2nd press", "2nd release", "1st release"];
+const ADV_KINDS: [&str; 4] = ["Dynamic keystroke", "Mod-tap", "Toggle", "Macro"];
+const CATEGORIES: [(&str, &str); 5] = [
+    ("Keyboard", "Keyboard keys"),
+    ("Media", "Media keys"),
+    ("Mouse", "Mouse buttons"),
+    ("Macro", "Macros"),
+    ("Disabled", "Turn the key off"),
+];
+
+fn code_name(code: u8) -> Option<&'static str> {
+    KEYCODES.iter().find(|(_, c)| *c == code).map(|(n, _)| *n)
+}
+/// "CapsLock" -> "Caps Lock", "KeyA" -> "A", "mouse_left" -> "Mouse left".
+fn pretty(name: &str) -> String {
+    let n = name.strip_prefix("Key").or_else(|| name.strip_prefix("Digit")).unwrap_or(name).replace('_', " ");
+    let mut out = String::new();
+    let mut prev = ' ';
+    for c in n.chars() {
+        if c.is_uppercase() && prev.is_lowercase() {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = c;
+    }
+    let mut cs = out.chars();
+    cs.next().map(|f| f.to_uppercase().chain(cs).collect()).unwrap_or_default()
+}
+/// Keycap-sized keycode label.
+fn short(name: &str) -> String {
+    match name {
+        "Escape" => "Esc",
+        "Return" | "Enter" => "Enter",
+        "PageUp" => "PgUp",
+        "PageDown" => "PgDn",
+        "PrintScreen" => "PrtSc",
+        "CapsLock" => "Caps",
+        "ScrollLock" => "ScrLk",
+        "NumLock" => "NumLk",
+        "Delete" => "Del",
+        "Insert" => "Ins",
+        "ArrowUp" => "↑",
+        "ArrowDown" => "↓",
+        "ArrowLeft" => "←",
+        "ArrowRight" => "→",
+        "Backquote" => "`",
+        "Minus" => "-",
+        "Equal" => "=",
+        "BracketLeft" => "[",
+        "BracketRight" => "]",
+        "Backslash" => "\\",
+        "Semicolon" => ";",
+        "Quote" => "'",
+        "Comma" => ",",
+        "Period" => ".",
+        "Slash" => "/",
+        "ControlLeft" => "LCtrl",
+        "ControlRight" => "RCtrl",
+        "ShiftLeft" => "LShift",
+        "ShiftRight" => "RShift",
+        "AltLeft" => "LAlt",
+        "AltRight" => "RAlt",
+        _ => return name.strip_prefix("Numpad").map_or_else(|| pretty(name), |n| format!("Num {}", pretty(n))),
+    }
+    .into()
+}
+fn binding_name(c: &[[u8; 4]; 4]) -> String {
+    match c[0] {
+        [9, _, id, _] => format!("Macro {}", id as u16 + 1),
+        [_, _, 0, _] => "Disabled".into(),
+        [_, _, code, _] => code_name(code).map_or_else(|| format!("Code {code}"), pretty),
+    }
+}
+fn binding_short(c: &[[u8; 4]; 4]) -> String {
+    match c[0] {
+        [9, _, id, _] => format!("M{}", id as u16 + 1),
+        [_, _, 0, _] => "Off".into(),
+        [_, _, code, _] => code_name(code).map_or_else(|| code.to_string(), short),
+    }
+}
+/// Phosphor glyph per EFFECTS value.
+fn effect_icon(effect: u8) -> &'static str {
+    use egui_phosphor::regular as i;
+    match effect {
+        8 => i::PROHIBIT,
+        0 => i::SPARKLE,
+        1 => i::WAVE_SINE,
+        3 => i::WAVE_TRIANGLE,
+        4 => i::SPIRAL,
+        5 => i::FLASK,
+        2 => i::SUN_DIM,
+        6 => i::CIRCLE,
+        7 => i::TARGET,
+        9 => i::FOOTPRINTS,
+        10 => i::PERSON_SIMPLE_RUN,
+        11 => i::BINARY,
+        12 => i::DOTS_NINE,
+        13 => i::RAINBOW,
+        14 => i::HEARTBEAT,
+        15 => i::NUMBER_SQUARE_EIGHT,
+        16 => i::LIGHTNING,
+        17 => i::PING_PONG,
+        18 => i::MOUNTAINS,
+        _ => i::QUESTION,
+    }
+}
+fn adv_name(a: &Advanced) -> String {
+    match a {
+        Advanced::Dks { .. } => "Dynamic keystroke".into(),
+        Advanced::ModTap { .. } => "Mod-tap".into(),
+        Advanced::Toggle { .. } => "Toggle".into(),
+        Advanced::Macro { id, .. } => format!("Macro {}", *id as u16 + 1),
+    }
+}
+fn adv_extra(a: &Advanced) -> String {
+    match a {
+        Advanced::Dks { modes, .. } => format!("{} stages", modes.iter().filter(|m| **m != 0).count()),
+        Advanced::ModTap { timeout } => format!("{timeout} ms"),
+        Advanced::Toggle { .. } => String::new(),
+        Advanced::Macro { repeat, .. } => ["×1", "toggle", "hold"].get(*repeat as usize).unwrap_or(&"").to_string(),
+    }
+}
+fn adv_short(a: &Advanced) -> &'static str {
+    match a {
+        Advanced::Dks { .. } => "DKS",
+        Advanced::ModTap { .. } => "Tap·Hold",
+        Advanced::Toggle { .. } => "Toggle",
+        Advanced::Macro { .. } => "Macro",
+    }
+}
+fn parse_macro(text: &str) -> anyhow::Result<Vec<MacroEvent>> {
+    let mut events = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let parts: Vec<_> = line.split_whitespace().collect();
+        anyhow::ensure!(parts.len() == 3, "macro lines: KeyA down|up delay_ms");
+        let key = KEYCODES
+            .iter()
+            .find(|(n, _)| *n == parts[0])
+            .ok_or_else(|| anyhow::anyhow!("unknown key {}", parts[0]))?
+            .1;
+        anyhow::ensure!(["down", "up"].contains(&parts[1]), "expected down or up");
+        events.push(MacroEvent { key, press: parts[1] == "down", delay: parts[2].parse()? });
+    }
+    anyhow::ensure!(!events.is_empty(), "macro must contain events");
+    Ok(events)
+}
+fn keycode_combo(ui: &mut Ui, id: impl std::hash::Hash, code: &mut u8, width: f32) {
+    let selected = code_name(*code).filter(|_| *code != 0).map_or_else(|| "None".into(), pretty);
+    // Truncate keeps every combo on the same layout path, so short and long names line up.
+    egui::ComboBox::from_id_salt(id).width(width).height(300.).wrap_mode(egui::TextWrapMode::Truncate).selected_text(selected).show_ui(ui, |ui| {
+        ui.selectable_value(code, 0, "None");
+        for (n, c) in KEYCODES.iter().filter(|(_, c)| *c != 0) {
+            ui.selectable_value(code, *c, pretty(n));
+        }
+    });
+}
+
+pub struct App {
+    state: State,
+    applied: State,
+    tx: Sender<Command>,
+    rx: Receiver<Event>,
+    join: Option<std::thread::JoinHandle<()>>,
+    device_tex: egui::TextureHandle,
+    dry: bool,
+    screen: Screen,
+    busy: bool,
+    progress: (usize, usize),
+    notice: Option<(String, bool)>,
+    connected: bool,
+    fw: Vec<String>,
+    ports: [String; 2],
+    /// Multi-selection (lighting, actuation) and single selection (keymap, advanced).
+    sel: BTreeSet<u8>,
+    key: u8,
+    paint: [u8; 3],
+    side_follow: bool,
+    per_key_scope: bool,
+    live: bool,
+    travel: f32,
+    show_remaps: bool,
+    category: usize,
+    adv_kind: usize,
+    codes: [u8; 4],
+    first: f32,
+    modes: [u8; 4],
+    timeout: u16,
+    toggle_kind: u8,
+    macro_text: String,
+    macro_id: u8,
+    repeat: u8,
+    confirm: String,
+    calib: u8,
+    theme: Theme,
+    colours: Colours,
+    theme_rx: Receiver<Theme>,
+    /// Pending zenity dialog: (save?, picked path).
+    dialog: Option<Receiver<(bool, anyhow::Result<Option<PathBuf>>)>>,
+}
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, state: State, dry: bool) -> Self {
+        w::install(&cc.egui_ctx);
+        let (theme, colours) = (Theme::load(), Colours::load());
+        theme::apply(&cc.egui_ctx, theme.palette(colours));
+        let theme_rx = theme::watch(cc.egui_ctx.clone());
+        let img = image::load_from_memory(include_bytes!("../../assets/device.png")).expect("bundled PNG").to_rgba8();
+        let device_tex = cc.egui_ctx.load_texture(
+            "device",
+            egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img),
+            egui::TextureOptions::LINEAR,
+        );
+        let (tx, rx, join) = device::worker(dry);
+        // Reads only: firmware, active profile/layer, sleep.
+        let _ = tx.send(Command::Info);
+        let mut app = Self {
+            applied: state.clone(),
+            state,
+            tx,
+            rx,
+            join: Some(join),
+            device_tex,
+            dry,
+            screen: Screen::Lighting,
+            busy: true,
+            progress: (0, 0),
+            notice: None,
+            connected: false,
+            fw: Vec::new(),
+            ports: ["—".into(), "—".into()],
+            sel: BTreeSet::new(),
+            key: 3,
+            paint: SWATCHES[0],
+            side_follow: false,
+            per_key_scope: false,
+            live: false,
+            travel: 0.,
+            show_remaps: true,
+            category: 0,
+            adv_kind: 0,
+            codes: [4, 5, 0, 0],
+            first: 1.5,
+            modes: [1, 0, 0, 1],
+            timeout: 200,
+            toggle_kind: 0,
+            macro_text: "KeyA down 50\nKeyA up 1".into(),
+            macro_id: 0,
+            repeat: 0,
+            confirm: String::new(),
+            calib: 0,
+            theme,
+            colours,
+            theme_rx,
+            dialog: None,
+        };
+        app.sync_layer_ui();
+        app
+    }
+    /// Lighting mode and side-light link follow whatever the selected layer holds.
+    fn sync_layer_ui(&mut self) {
+        let l = self.state.current();
+        self.side_follow = l.side_lighting == l.lighting;
+    }
+    fn send(&mut self, c: Command) {
+        match self.tx.send(c) {
+            Ok(()) => {
+                self.busy = true;
+                self.progress = (0, 0);
+            }
+            Err(e) => self.notice = Some((e.to_string(), true)),
+        }
+    }
+    fn write(&mut self, r: anyhow::Result<Vec<p::Report>>, saved: Option<State>) {
+        match r {
+            Ok(reports) if reports.is_empty() => self.notice = Some(("Nothing to write.".into(), false)),
+            Ok(reports) => self.send(Command::Write { reports, state: saved.map(Box::new) }),
+            Err(e) => self.notice = Some((format!("{e:#}"), true)),
+        }
+    }
+    fn at(&self) -> (usize, usize) {
+        (self.state.profile as usize, self.state.layer as usize)
+    }
+    /// Last applied state with `parts` of the edited selection merged in.
+    fn commit(&self, parts: &[Part]) -> State {
+        let (pi, li) = self.at();
+        let mut s = self.applied.clone();
+        (s.profile, s.layer) = (self.state.profile, self.state.layer);
+        for part in parts {
+            copy(*part, pi, li, &self.state, &mut s);
+        }
+        s
+    }
+    fn screen_dirty(&self, screen: Screen) -> bool {
+        let (pi, li) = self.at();
+        screen.parts().iter().any(|part| !same(*part, pi, li, &self.state, &self.applied))
+    }
+    fn dirty(&self) -> bool {
+        self.screen_dirty(self.screen)
+    }
+    fn revert(&mut self) {
+        let (pi, li) = self.at();
+        for part in self.screen.parts() {
+            copy(*part, pi, li, &self.applied, &mut self.state);
+        }
+        self.sync_layer_ui();
+    }
+    fn apply(&mut self) {
+        match self.screen {
+            Screen::Lighting => {
+                let r = state::lighting_changes(&self.state, &self.applied);
+                self.write(r, Some(self.commit(&[Part::Preset, Part::PerKey])));
+            }
+            Screen::Actuation => self.write(state::actuation_reports(&self.state), Some(self.commit(&[Part::Actuation]))),
+            Screen::Keymap | Screen::Advanced => {
+                self.write(state::key_changes(&self.state, &self.applied), Some(self.commit(&[Part::Keys])))
+            }
+            Screen::Performance => {
+                self.write(state::performance_changes(&self.state, &self.applied), Some(self.commit(&[Part::Performance])))
+            }
+            Screen::Device => {}
+        }
+    }
+    /// Sidebar profile/layer switch: re-sends the last applied settings for that slot.
+    fn activate(&mut self, profile: u8, layer: u8) {
+        let mut s = self.applied.clone();
+        (s.profile, s.layer) = (profile, layer);
+        (self.state.profile, self.state.layer) = (profile, layer);
+        self.sync_layer_ui();
+        self.write(state::activate_reports(&s), Some(s));
+    }
+    fn poll(&mut self) {
+        while let Ok(e) = self.rx.try_recv() {
+            match e {
+                Event::Progress(i, n) => self.progress = (i, n),
+                Event::Info { fw, profile, layer, ports, .. } => {
+                    self.fw = fw.split(" / ").map(String::from).collect();
+                    self.ports = ports;
+                    self.connected = true;
+                    // Dry-run replies are all zeros; keep the saved slot instead.
+                    if !self.dry {
+                        for s in [&mut self.state, &mut self.applied] {
+                            (s.profile, s.layer) = (profile, layer);
+                        }
+                        self.sync_layer_ui();
+                    }
+                }
+                Event::Saved(s) => self.applied = *s,
+                Event::Live(v) => self.travel = v,
+                Event::Done => self.busy = false,
+                Event::Error(e) => {
+                    self.busy = false;
+                    (self.state.profile, self.state.layer) = (self.applied.profile, self.applied.layer);
+                    self.notice = Some((e, true));
+                }
+                Event::Status(s) => self.notice = Some((s, false)),
+            }
+        }
+    }
+
+    /// Sidebar: brand, device card, profile/layer and labelled navigation.
+    fn sidebar(&mut self, ui: &mut Ui) {
+        let c = pal();
+        let (dot, status) = match (self.dry, self.connected, self.busy) {
+            (true, ..) => (c.accent, "Dry run · simulated".to_string()),
+            (_, true, _) => (c.ok, format!("USB · {}", self.fw.first().map_or("", String::as_str))),
+            (_, _, true) => (c.dim, "Connecting…".into()),
+            _ => (c.danger, "Not connected".into()),
+        };
+        ui.spacing_mut().item_spacing.y = 24.;
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.;
+            w::spaced(ui, "INGLORIOUS", w::logo(24.), c.accent, 1.);
+            w::spaced(ui, "CORE · LINUX", w::strong(11.), c.dim, 2.);
+        });
+        egui::Frame::new().fill(c.surface1).corner_radius(12).inner_margin(12).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 10.;
+            // device.png is 600x400 with the board drawn at (66, 98)-(534, 302), shadow included.
+            let uv = egui::Rect::from_min_max(pos2(66. / 600., 98. / 400.), pos2(534. / 600., 302. / 400.));
+            let width = ui.available_width();
+            let (r, _) = ui.allocate_exact_size(vec2(width, width * 204. / 468.), Sense::hover());
+            ui.painter().image(self.device_tex.id(), r, uv, Color32::WHITE);
+            w::text(ui, "GMMK 3 HE 75%", w::strong(15.), c.text);
+            ui.horizontal(|ui| {
+                let (r, _) = ui.allocate_exact_size(vec2(8., 8.), Sense::hover());
+                ui.painter().circle_filled(r.center(), 4., dot);
+                w::text(ui, status, w::body(12.), c.muted);
+            });
+        });
+        ui.add_enabled_ui(!self.busy, |ui| {
+            ui.spacing_mut().item_spacing.y = 24.;
+            let (pi, li) = (self.state.profile, self.state.layer);
+            for (title, labels, current) in [("PROFILE", ["1", "2", "3"], pi), ("LAYER", LAYERS, li)] {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6., 8.);
+                    w::spaced(ui, title, w::strong(11.), c.dim, 1.5);
+                    ui.horizontal(|ui| {
+                        let width = (ui.available_width() - 12.) / 3.;
+                        for (i, l) in (0u8..).zip(labels) {
+                            let tip = if title == "PROFILE" {
+                                format!("Switch the board to profile {}", i + 1)
+                            } else {
+                                format!("Switch the board to the {} layer", LAYERS[i as usize])
+                            };
+                            if w::button_w(ui, l, Kind::Seg(i == current), Some(width)).on_hover_text(tip).clicked() && i != current {
+                                if title == "PROFILE" { self.activate(i, li) } else { self.activate(pi, i) }
+                            }
+                        }
+                    });
+                });
+            }
+        });
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.;
+            for (n, (s, label, icon)) in SCREENS.into_iter().enumerate() {
+                let resp = w::nav_item(ui, icon, label, self.screen == s, self.screen_dirty(s));
+                if resp.on_hover_text(format!("Ctrl+{}", n + 1)).clicked() {
+                    self.screen = s;
+                }
+            }
+        });
+        if ui.available_height() > 40. {
+            ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = 2.;
+                w::text(ui, format!("inglorious-core {}", env!("CARGO_PKG_VERSION")), w::body(11.), c.dim);
+                w::text(ui, "Settings are stored on the keyboard.", w::body(11.), c.dim);
+            });
+        }
+    }
+
+    fn header(&mut self, ui: &mut Ui) {
+        let c = pal();
+        let (pi, li) = self.at();
+        let (title, sub) = match self.screen {
+            Screen::Lighting => ("Lighting", format!("Profile {} · {} — preset effect with per-key overrides", pi + 1, LAYERS[li])),
+            Screen::Actuation => ("Actuation", "Hall-effect travel, rapid trigger and deadzone".into()),
+            Screen::Keymap => ("Keymap", format!("Remap keys on Profile {} · {}", pi + 1, LAYERS[li])),
+            Screen::Advanced => ("Advanced keys", "Dynamic keystroke, mod-tap, toggle and macros".into()),
+            Screen::Performance => ("Performance", format!("Polling rate, debounce and sleep — applies to Profile {}", pi + 1)),
+            Screen::Device => ("Device", "GMMK 3 HE 75% ANSI · 342d:e3de".into()),
+        };
+        let title_block = |ui: &mut Ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 4.;
+                w::text(ui, title, w::heading(28.), c.text);
+                w::text(ui, &sub, w::body(13.), c.muted);
+            });
+        };
+        // Narrow tiles put the actions on their own line under the title.
+        if ui.available_width() >= 760. {
+            ui.horizontal(|ui| {
+                title_block(ui);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.header_actions(ui));
+            });
+        } else {
+            title_block(ui);
+            ui.horizontal(|ui| ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.header_actions(ui)));
+        }
+        if let Some((msg, err)) = self.notice.clone() {
+            egui::Frame::new()
+                .fill(c.surface1)
+                .stroke(w::line(1., if err { c.danger } else { c.border_strong }))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::symmetric(16, 8))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let icon = if err { egui_phosphor::regular::WARNING } else { egui_phosphor::regular::INFO };
+                        w::text(ui, icon, w::body(16.), if err { c.danger } else { c.muted });
+                        ui.allocate_ui(vec2(ui.available_width() - 90., 36.), |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(msg).color(if err { c.danger } else { c.muted })).wrap());
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if w::button(ui, "Dismiss", Kind::Ghost).clicked() {
+                                self.notice = None;
+                            }
+                        });
+                    });
+                });
+        }
+    }
+    /// Header actions, right to left: Apply (or Re-read), Revert, status pill.
+    fn header_actions(&mut self, ui: &mut Ui) {
+        let c = pal();
+        ui.spacing_mut().item_spacing.x = 12.;
+        let dirty = self.dirty();
+        if self.screen == Screen::Device {
+            let reread = ui.add_enabled_ui(!self.busy, |ui| w::button(ui, "Re-read device", Kind::Secondary)).inner;
+            if reread.on_hover_text("Read firmware, profile and sleep again (Ctrl+R)").clicked() {
+                self.send(Command::Info);
+            }
+        } else {
+            let apply = ui.add_enabled_ui(!self.busy && dirty, |ui| w::button(ui, "Apply to keyboard", Kind::Primary)).inner;
+            if apply.on_hover_text("Write this screen's changes to the keyboard (Ctrl+S)").clicked() {
+                self.apply();
+            }
+            if dirty && !self.busy && w::button(ui, "Revert", Kind::Ghost).on_hover_text("Discard this screen's unapplied changes (Ctrl+Z)").clicked() {
+                self.revert();
+            }
+        }
+        match (self.busy, self.progress, self.screen) {
+            (true, (i, n), _) if n > 0 => w::pill(ui, c.accent, &format!("Writing {i}/{n}…"), true),
+            (true, ..) => w::pill(ui, c.accent, if self.connected { "Working…" } else { "Connecting…" }, true),
+            (_, _, Screen::Device) if !self.connected => w::pill(ui, c.danger, "Not connected", false),
+            _ if dirty => w::pill(ui, c.accent, "Unsaved changes", false),
+            _ => w::pill(ui, c.ok, "Synced with keyboard", false),
+        }
+    }
+    /// Ctrl+1…6 switch screens, Ctrl+S / Ctrl+Enter apply, Ctrl+Z reverts, Ctrl+R / F5 re-reads.
+    /// Skipped while a text field has focus so its own keys (undo, Enter) keep working.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        for (n, k) in [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6].into_iter().enumerate() {
+            if hit(Modifiers::COMMAND, k) {
+                self.screen = SCREENS[n].0;
+            }
+        }
+        if self.busy {
+            return;
+        }
+        if (hit(Modifiers::COMMAND, Key::S) || hit(Modifiers::COMMAND, Key::Enter)) && self.dirty() {
+            self.apply();
+        }
+        if hit(Modifiers::COMMAND, Key::Z) && self.dirty() {
+            self.revert();
+        }
+        if hit(Modifiers::COMMAND, Key::R) || hit(Modifiers::NONE, Key::F5) {
+            self.send(Command::Info);
+        }
+    }
+    /// Runs the zenity file dialog on its own thread so the window keeps drawing.
+    fn open_dialog(&mut self, ctx: &egui::Context, save: bool) {
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((save, device::pick_file(save)));
+            ctx.request_repaint();
+        });
+        self.dialog = Some(rx);
+    }
+    /// Export or import once the dialog returns.
+    fn poll_dialog(&mut self) {
+        let Some(Ok((save, picked))) = self.dialog.as_ref().map(Receiver::try_recv) else {
+            return;
+        };
+        self.dialog = None;
+        let path = match picked {
+            Ok(Some(p)) => p,
+            Ok(None) => return,
+            Err(e) => return self.notice = Some((format!("{e:#}"), true)),
+        };
+        if save {
+            self.notice = Some(match device::save_state_to(&self.applied, &path) {
+                Ok(()) => (format!("Exported to {}", path.display()), false),
+                Err(e) => (format!("{e:#}"), true),
+            });
+            return;
+        }
+        match device::load_state_from(&path) {
+            Ok(mut s) => {
+                (s.profile, s.layer) = (self.state.profile, self.state.layer);
+                self.state = s;
+                self.sync_layer_ui();
+                self.notice = Some(("Imported. Review each screen, then apply.".into(), false));
+            }
+            Err(e) => self.notice = Some((format!("{e:#}"), true)),
+        }
+    }
+
+    /// Quick-select chips; returns true when one was clicked.
+    fn quick(&mut self, ui: &mut Ui, names: &[&str]) -> bool {
+        let mut clicked = false;
+        for name in names {
+            let set: BTreeSet<u8> = w::keys()
+                .filter(|(_, n)| match *name {
+                    "All" => true,
+                    "Alphas" => n.starts_with("Key"),
+                    "Numbers" => n.starts_with("Digit"),
+                    "F-keys" => n.len() > 1 && n.starts_with('F') && n[1..].chars().all(|c| c.is_ascii_digit()),
+                    "WASD" => matches!(*n, "KeyW" | "KeyA" | "KeyS" | "KeyD"),
+                    "Arrows" => n.starts_with("Arrow"),
+                    "Modifiers" => matches!(*n, "ShiftLeft" | "ShiftRight" | "ControlLeft" | "MetaLeft" | "AltLeft" | "AltRight" | "Fn"),
+                    _ => false,
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if w::button(ui, name, Kind::Seg(!set.is_empty() && set == self.sel)).clicked() {
+                self.sel = set;
+                clicked = true;
+            }
+        }
+        clicked
+    }
+    fn toggle_sel(&mut self, k: u8) {
+        if !self.sel.remove(&k) {
+            self.sel.insert(k);
+        }
+    }
+    fn set_colour(&mut self, c: [u8; 3]) {
+        if self.state.current().per_key_on {
+            self.paint = c;
+            let l = self.state.current_mut();
+            for k in &self.sel {
+                l.colors[*k as usize] = KeyLight { rgb: c, mode: 1 };
+            }
+        } else {
+            // The original only offers a colour in single-colour mode.
+            let l = &mut self.state.current_mut().lighting;
+            l.rgb = c;
+            if !MULTICOLOUR_ONLY.contains(&l.effect) {
+                l.color_mode = SINGLE_COLOUR;
+            }
+        }
+    }
+
+    fn lighting(&mut self, ui: &mut Ui) {
+        if self.side_follow {
+            let l = self.state.current().lighting.clone();
+            self.state.current_mut().side_lighting = l;
+        }
+        w::panel(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.;
+            w::toolbar(ui, 860., |ui, right| {
+                if right {
+                    let on = &mut self.state.current_mut().per_key_on;
+                    if w::button(ui, "Per-key paint", Kind::Seg(*on)).on_hover_text("Painted colours on top of the base effect").clicked() {
+                        *on = true;
+                    }
+                    if w::button(ui, "Preset effect", Kind::Seg(!*on)).on_hover_text("Base effect on every key; painted colours are kept").clicked() {
+                        *on = false;
+                    }
+                } else {
+                    self.quick(ui, &["All", "Alphas", "Numbers", "F-keys", "WASD", "Arrows", "Modifiers", "Clear"]);
+                }
+            });
+            let l = self.state.current();
+            // Keys without a per-key colour preview the base effect (in the app only).
+            let (t, off) = (ui.input(|i| i.time) as f32, pal().surface2);
+            if effects::animated(l.lighting.effect) {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            let clicked = w::keyboard(ui, &|k| KeyLook {
+                fill: match l.colors.get(k as usize).filter(|c| l.per_key_on && c.mode != 0) {
+                    Some(c) => Some(w::rgb(c.rgb)),
+                    None if l.lighting.effect != 8 => w::key_pos(k).map(|(x, y)| effects::sample(&l.lighting, x, y, t, off)),
+                    None => None,
+                },
+                selected: self.sel.contains(&k),
+                ..Default::default()
+            });
+            if let Some(k) = clicked.filter(|k| *k != w::ENCODER) {
+                self.toggle_sel(k);
+            }
+        });
+        let r = w::row(ui, &[0., 360., 250.], 246.);
+        let mut show_effect = false;
+        let (can_apply, mut apply_now) = (self.dirty(), false);
+        w::place(ui, r[0], |ui| {
+            w::card(ui, "Base effect", Some("Shown on keys without a per-key colour"), |ui| {
+                let (t, off) = (ui.input(|i| i.time) as f32, pal().surface2);
+                let l = &mut self.state.current_mut().lighting;
+                let shown = l.clone();
+                let name = EFFECTS.iter().find(|(_, v)| *v == l.effect).map_or("Unknown", |(n, _)| *n);
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("effect")
+                        .width(ui.available_width() - 96.)
+                        .height(480.)
+                        .selected_text(egui::RichText::new(format!("{}   {name}", effect_icon(l.effect))).size(14.).color(pal().text))
+                        .show_ui(ui, |ui| {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+                            for (name, v) in EFFECTS {
+                                let row = egui::RichText::new(format!("{}   {name}", effect_icon(*v))).size(14.);
+                                let resp = ui.selectable_label(l.effect == *v, row);
+                                // Each row previews its effect as it would be picked: multicolour, full brightness.
+                                let look = p::Lighting { effect: *v, color_mode: MULTICOLOUR, brightness: 100, ..shown.clone() };
+                                let thumb = egui::Rect::from_min_size(pos2(resp.rect.right() - 62., resp.rect.center().y - 9.), vec2(54., 18.));
+                                effects::thumb(ui.painter(), thumb, &look, t, pal().surface3);
+                                if resp.clicked() {
+                                    // Picking an effect shows it on the whole board, in multicolour.
+                                    (l.effect, l.color_mode) = (*v, MULTICOLOUR);
+                                    show_effect = true;
+                                }
+                            }
+                        });
+                    let (chip, _) = ui.allocate_exact_size(vec2(84., w::CONTROL_H), Sense::hover());
+                    ui.painter().rect_filled(chip, 8, off);
+                    effects::thumb(ui.painter(), chip.shrink(6.), l, t, pal().surface3);
+                    ui.interact(chip, ui.id().with("chip"), Sense::hover()).on_hover_text("Preview, drawn by the app: the keyboard runs the real effect");
+                });
+                // Same action as the header button.
+                let apply_button = |ui: &mut Ui| ui.add_enabled_ui(can_apply, |ui| w::button(ui, "Apply", Kind::Primary)).inner.on_hover_text("Ctrl+S").clicked();
+                let narrow = ui.available_width() < 320.;
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!MULTICOLOUR_ONLY.contains(&l.effect), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.;
+                        for (mode, label) in [(MULTICOLOUR, "Multicolour"), (SINGLE_COLOUR, "Single colour")] {
+                            if w::button(ui, label, Kind::Seg(l.color_mode == mode)).clicked() {
+                                l.color_mode = mode;
+                            }
+                        }
+                    });
+                    if !narrow {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| apply_now = apply_button(ui));
+                    }
+                });
+                if narrow {
+                    apply_now = apply_button(ui);
+                }
+            })
+        });
+        if show_effect {
+            self.state.current_mut().per_key_on = false;
+        }
+        if apply_now {
+            self.apply();
+        }
+        let per_key = self.state.current().per_key_on;
+        w::place(ui, r[1], |ui| {
+            w::card(ui, "Colour", Some("Paint colour for selected keys"), |ui| {
+                let target = if per_key { self.paint } else { self.state.current().lighting.rgb };
+                let mut pick = target;
+                let mut erase = false;
+                let theme_rgb = self.theme.keyboard;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.;
+                    let n = SWATCHES.len() + 1 + usize::from(per_key) + usize::from(theme_rgb.is_some());
+                    let size = ((ui.available_width() + 6.) / n as f32 - 6.).clamp(20., 28.);
+                    if let Some(t) = theme_rgb {
+                        let tip = format!("{} theme keyboard colour", self.theme.name.as_deref().unwrap_or("Omarchy"));
+                        if w::swatch(ui, w::rgb(t), target == t, size).on_hover_text(tip).clicked() {
+                            pick = t;
+                        }
+                    }
+                    for c in SWATCHES {
+                        if w::swatch(ui, w::rgb(c), target == c, size).clicked() {
+                            pick = c;
+                        }
+                    }
+                    w::colour_button(ui, &mut pick, size, Some(egui_phosphor::regular::PLUS)).on_hover_text("Custom colour");
+                    if per_key {
+                        erase = w::no_colour(ui, size).on_hover_text("Remove colour: selected keys show the base effect").clicked();
+                    }
+                });
+                if pick != target {
+                    self.set_colour(pick);
+                }
+                if erase {
+                    let l = self.state.current_mut();
+                    for k in &self.sel {
+                        l.colors[*k as usize] = KeyLight::default();
+                    }
+                }
+                let l = &mut self.state.current_mut().lighting;
+                w::slider_int(ui, "Brightness", &format!("{}%", l.brightness), &mut l.brightness, 0.0..=100., 1.);
+                w::slider_int(ui, "Speed", &format!("{}%", l.speed), &mut l.speed, 0.0..=100., 1.);
+            })
+        });
+        w::place(ui, r[2], |ui| {
+            w::card(ui, "Side lights", None, |ui| {
+                w::split(ui, "Follow keyboard", |ui| w::toggle(ui, &mut self.side_follow));
+                ui.add_enabled_ui(!self.side_follow, |ui| {
+                    ui.spacing_mut().item_spacing.y = 16.;
+                    let l = self.state.current_mut();
+                    let s = &mut l.side_lighting;
+                    let recoloured = w::split(ui, "Colour", |ui| w::colour_button(ui, &mut s.rgb, 28., None)).changed();
+                    w::slider_int(ui, "Brightness", &format!("{}%", s.brightness), &mut s.brightness, 0.0..=100., 1.);
+                    // In per-key mode the side LEDs are entries 128..158 of the colour array.
+                    if recoloured && l.per_key_on {
+                        let rgb = l.side_lighting.rgb;
+                        l.colors[128..158].fill(KeyLight { rgb, mode: 1 });
+                    }
+                });
+            })
+        });
+    }
+
+    fn actuation(&mut self, ui: &mut Ui) {
+        let global = self.state.current().actuation.clone();
+        w::panel(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.;
+            w::toolbar(ui, 560., |ui, right| {
+                if right {
+                    if w::button(ui, "Per-key", Kind::Seg(self.per_key_scope)).on_hover_text("Override the selected keys").clicked() {
+                        self.per_key_scope = true;
+                    }
+                    if w::button(ui, "Global", Kind::Seg(!self.per_key_scope)).on_hover_text("One setting for every key on this layer").clicked() {
+                        self.per_key_scope = false;
+                    }
+                } else if self.quick(ui, &["All", "Alphas", "WASD", "Arrows", "Clear"]) {
+                    self.per_key_scope = !self.sel.is_empty();
+                }
+            });
+            let l = self.state.current();
+            let clicked = w::keyboard(ui, &|k| {
+                let a = l.per_key.get(&k);
+                KeyLook {
+                    value: (k < 90 && k != w::ENCODER).then(|| format!("{:.1}", a.unwrap_or(&global).press)),
+                    selected: self.per_key_scope && self.sel.contains(&k),
+                    raised: a.is_some(),
+                    ..Default::default()
+                }
+            });
+            if let Some(k) = clicked.filter(|k| *k < 90 && *k != w::ENCODER) {
+                if !self.per_key_scope {
+                    self.per_key_scope = true;
+                    self.sel.clear();
+                }
+                self.toggle_sel(k);
+            }
+        });
+        let keys: Vec<u8> = self.sel.iter().copied().filter(|k| *k < 90 && *k != w::ENCODER).collect();
+        let usable = !self.per_key_scope || !keys.is_empty();
+        let mut a = match (self.per_key_scope, keys.first()) {
+            (true, Some(k)) => self.state.current().per_key.get(k).cloned().unwrap_or_else(|| global.clone()),
+            _ => global.clone(),
+        };
+        let sub = match (self.per_key_scope, keys.len()) {
+            (false, _) => "All keys · 0.1 – 4.0 mm".to_string(),
+            (true, 0) => "Select keys to override the global point".into(),
+            (true, n) => format!("{n} keys selected · 0.1 – 4.0 mm"),
+        };
+        let has_override = self.per_key_scope && keys.iter().any(|k| self.state.current().per_key.contains_key(k));
+        let (mut changed, mut reset) = (false, false);
+        let mut deadzone = global.deadzone.unwrap_or(4.);
+        let r = w::row(ui, &[0., 0., 260.], 246.);
+        let dz_changed = w::place(ui, r[0], |ui| {
+            w::card(ui, "Actuation point", Some(&sub), |ui| {
+                ui.add_enabled_ui(usable, |ui| {
+                    changed |= w::slider(ui, "Press point", &format!("{:.1} mm", a.press), &mut a.press, 0.1..=4., 0.1).changed();
+                });
+                let dz = w::slider(ui, "Bottom deadzone", &format!("{deadzone:.1} mm"), &mut deadzone, 0.1..=4., 0.1)
+                    .on_hover_text("Global for the layer; the firmware ignores per-key deadzones.")
+                    .changed();
+                if has_override {
+                    reset = w::button(ui, "Reset selected to global", Kind::Secondary).clicked();
+                }
+                dz
+            })
+        });
+        w::place(ui, r[1], |ui| {
+            w::card(ui, "Rapid trigger", Some("Re-fire on small movements"), |ui| {
+                ui.add_enabled_ui(usable, |ui| {
+                    ui.spacing_mut().item_spacing.y = 16.;
+                    changed |= w::split(ui, "Enabled", |ui| w::toggle(ui, &mut a.rapid)).changed();
+                    ui.add_enabled_ui(a.rapid, |ui| {
+                        ui.spacing_mut().item_spacing.y = 16.;
+                        changed |= w::slider(ui, "Press sensitivity", &format!("{:.1} mm", a.rapid_press), &mut a.rapid_press, 0.1..=4., 0.1).changed();
+                        changed |= w::slider(ui, "Release sensitivity", &format!("{:.1} mm", a.rapid_release), &mut a.rapid_release, 0.1..=4., 0.1).changed();
+                    });
+                });
+            })
+        });
+        let press = a.press;
+        w::place(ui, r[2], |ui| {
+            w::card(ui, "Live travel", Some("Press any key to test"), |ui| {
+                let mm = self.travel * 4.;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 16.;
+                    let (bar, _) = ui.allocate_exact_size(vec2(28., 120.), Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(bar, 8, pal().surface3);
+                    let level = egui::Rect::from_min_max(pos2(bar.left(), bar.bottom() - bar.height() * self.travel), bar.max);
+                    p.rect_filled(level, egui::CornerRadius { nw: 0, ne: 0, sw: 8, se: 8 }, pal().accent);
+                    let y = bar.bottom() - bar.height() * (press / 4.);
+                    p.line_segment([pos2(bar.left(), y), pos2(bar.right(), y)], w::line(2., pal().text));
+                    ui.vertical(|ui| {
+                        ui.add_space(70.);
+                        ui.spacing_mut().item_spacing.y = 4.;
+                        w::text(ui, format!("{mm:.1} mm"), w::mono(22.), pal().text);
+                        let down = self.live && mm >= press;
+                        let state = if !self.live { "live view off" } else if down { "actuated" } else { "released" };
+                        w::text(ui, state, w::body(12.), if down { pal().ok } else { pal().dim });
+                    });
+                });
+                let mut live = self.live;
+                if w::split(ui, "Live view", |ui| w::toggle(ui, &mut live)).changed() {
+                    self.live = live;
+                    self.send(Command::Live(live));
+                }
+            })
+        });
+        let l = self.state.current_mut();
+        if changed {
+            if self.per_key_scope {
+                a.deadzone = None;
+                for k in &keys {
+                    l.per_key.insert(*k, a.clone());
+                }
+            } else {
+                a.deadzone = l.actuation.deadzone;
+                l.actuation = a;
+            }
+        }
+        if dz_changed {
+            l.actuation.deadzone = Some(deadzone);
+        }
+        if reset {
+            for k in &keys {
+                l.per_key.remove(k);
+            }
+        }
+    }
+
+    fn keymap(&mut self, ui: &mut Ui) {
+        w::panel(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.;
+            w::toolbar(ui, 560., |ui, right| {
+                if right {
+                    if w::button(ui, "Show remaps", Kind::Seg(self.show_remaps)).clicked() {
+                        self.show_remaps = true;
+                    }
+                    if w::button(ui, "Show labels", Kind::Seg(!self.show_remaps)).clicked() {
+                        self.show_remaps = false;
+                    }
+                } else {
+                    w::text(ui, "Click a key, then pick what it should send.", w::body(13.), pal().muted);
+                }
+            });
+            let l = self.state.current();
+            let clicked = w::keyboard(ui, &|k| {
+                let remap = l.bindings.get(&k).filter(|_| self.show_remaps && !l.advanced.contains_key(&k));
+                KeyLook { value: remap.map(binding_short), raised: remap.is_some(), selected: k == self.key, ..Default::default() }
+            });
+            if let Some(k) = clicked.filter(|k| *k != w::BADGE) {
+                self.key = k;
+            }
+        });
+        let k = self.key;
+        let l = self.state.current();
+        let default = state::default_code(k).ok().and_then(code_name).map_or_else(|| "—".into(), pretty);
+        let sends = l.bindings.get(&k).map_or_else(|| "Default".into(), binding_name);
+        let custom = l.bindings.contains_key(&k) || l.advanced.contains_key(&k);
+        let current = l.bindings.get(&k).map(|c| c[0]);
+        let changes: Vec<(u8, String)> =
+            l.bindings.iter().filter(|(k, _)| !l.advanced.contains_key(k)).map(|(k, c)| (*k, binding_name(c))).collect();
+        let r = w::row(ui, &[280., 0., 300.], 246.);
+        w::place(ui, r[0], |ui| {
+            w::card(ui, &pretty(w::key_name(k)), Some(&format!("Selected key · physical #{k}")), |ui| {
+                ui.spacing_mut().item_spacing.y = 14.;
+                w::kv(ui, "Default", &default, w::strong(13.));
+                w::kv(ui, "Sends", &sends, w::strong(13.));
+                if ui.add_enabled_ui(custom, |ui| w::button(ui, "Reset to default", Kind::Secondary)).inner.clicked() {
+                    let l = self.state.current_mut();
+                    l.bindings.remove(&k);
+                    l.advanced.remove(&k);
+                }
+            })
+        });
+        let mut pick = None;
+        w::place(ui, r[1], |ui| {
+            w::card(ui, "Assign", Some(CATEGORIES[self.category].1), |ui| {
+                ui.spacing_mut().item_spacing.y = 14.;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6., 6.);
+                    for (i, (n, _)) in CATEGORIES.iter().enumerate() {
+                        if w::button(ui, n, Kind::Seg(i == self.category)).clicked() {
+                            self.category = i;
+                        }
+                    }
+                });
+                egui::ScrollArea::vertical().id_salt("codes").auto_shrink([false, true]).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(6., 6.);
+                        match self.category {
+                            0 | 2 => {
+                                let mut seen = BTreeSet::new();
+                                for (n, c) in KEYCODES {
+                                    if *c == 0 || (*c >= 240) != (self.category == 2) || !seen.insert(*c) {
+                                        continue;
+                                    }
+                                    let on = current == Some([0, 0, *c, 0]);
+                                    if w::button(ui, &short(n), Kind::Seg(on)).on_hover_text(pretty(n)).clicked() {
+                                        pick = Some(*c);
+                                    }
+                                }
+                            }
+                            1 => {
+                                w::para(ui, "Media keys need consumer-control codes this port doesn't send yet.", w::body(13.), pal().dim);
+                            }
+                            3 => {
+                                w::para(ui, "Macros are recorded and bound in Advanced keys.", w::body(13.), pal().dim);
+                            }
+                            _ => {
+                                if w::button(ui, "Disable key", Kind::Seg(current == Some([0; 4]))).clicked() {
+                                    pick = Some(0);
+                                }
+                            }
+                        }
+                    });
+                });
+            })
+        });
+        if let Some(c) = pick {
+            let l = self.state.current_mut();
+            l.bindings.insert(k, [[0, 0, c, 0], [0; 4], [0; 4], [0; 4]]);
+            l.advanced.remove(&k);
+        }
+        w::place(ui, r[2], |ui| {
+            w::card(ui, "Changes on this layer", None, |ui| {
+                ui.spacing_mut().item_spacing.y = 14.;
+                if changes.is_empty() {
+                    w::para(ui, "No remaps on this layer.", w::body(13.), pal().dim);
+                }
+                egui::ScrollArea::vertical().id_salt("changes").show(ui, |ui| {
+                    for (k, t) in changes {
+                        if w::list_item(ui, w::key_label(k), &t, "", k == self.key).clicked() {
+                            self.key = k;
+                        }
+                    }
+                });
+            })
+        });
+    }
+
+    fn select_adv(&mut self, k: u8) {
+        self.key = k;
+        let l = self.state.current();
+        let (codes, adv) = (l.bindings.get(&k).copied(), l.advanced.get(&k).cloned());
+        match adv {
+            Some(Advanced::Dks { first, modes, .. }) => (self.adv_kind, self.first, self.modes) = (0, first, modes),
+            Some(Advanced::ModTap { timeout }) => (self.adv_kind, self.timeout) = (1, timeout),
+            Some(Advanced::Toggle { kind }) => (self.adv_kind, self.toggle_kind) = (2, kind),
+            Some(Advanced::Macro { id, repeat, events }) => {
+                (self.adv_kind, self.macro_id, self.repeat) = (3, id, repeat);
+                self.macro_text = events
+                    .iter()
+                    .map(|e| format!("{} {} {}", code_name(e.key).unwrap_or("?"), if e.press { "down" } else { "up" }, e.delay))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return;
+            }
+            None => return,
+        }
+        if let Some(c) = codes {
+            self.codes = c.map(|s| s[2]);
+        }
+    }
+    /// "+ Add binding": stores the edited advanced function on the selected key (applied later).
+    fn store_adv(&mut self) {
+        let slots = self.codes.map(|c| [0, 0, c, 0]);
+        let r: anyhow::Result<_> = match self.adv_kind {
+            0 => Ok((Advanced::Dks { first: self.first, second: self.first, modes: self.modes }, slots)),
+            1 => Ok((Advanced::ModTap { timeout: self.timeout }, slots)),
+            2 => Ok((Advanced::Toggle { kind: self.toggle_kind }, slots)),
+            _ => (|| {
+                let events = parse_macro(&self.macro_text)?;
+                let code = p::macro_keycode(self.macro_id, self.repeat)?;
+                Ok((Advanced::Macro { id: self.macro_id, repeat: self.repeat, events }, [code, [0; 4], [0; 4], [0; 4]]))
+            })(),
+        };
+        match r {
+            Ok((a, c)) => {
+                let l = self.state.current_mut();
+                l.advanced.insert(self.key, a);
+                l.bindings.insert(self.key, c);
+            }
+            Err(e) => self.notice = Some((format!("{e:#}"), true)),
+        }
+    }
+
+    fn advanced(&mut self, ui: &mut Ui) {
+        let has = self.state.current().advanced.contains_key(&self.key);
+        let mut add = false;
+        w::panel(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 8.;
+            w::toolbar(ui, 560., |ui, right| {
+                if right {
+                    let tip = "Store this function on the selected key; Apply writes it";
+                    add = w::button(ui, if has { "Update binding" } else { "+ Add binding" }, Kind::Secondary).on_hover_text(tip).clicked();
+                } else {
+                    for (i, n) in ADV_KINDS.iter().enumerate() {
+                        if w::button(ui, n, Kind::Seg(i == self.adv_kind)).clicked() {
+                            self.adv_kind = i;
+                        }
+                    }
+                }
+            });
+            let l = self.state.current();
+            let clicked = w::keyboard(ui, &|k| {
+                let a = l.advanced.get(&k);
+                KeyLook { value: a.map(|a| adv_short(a).into()), raised: a.is_some(), selected: k == self.key, ..Default::default() }
+            });
+            if let Some(k) = clicked.filter(|k| *k != w::BADGE) {
+                self.select_adv(k);
+            }
+        });
+        if add {
+            self.store_adv();
+        }
+        let label = w::key_label(self.key);
+        let r = w::row(ui, &[300., 0., 300.], 246.);
+        let actions = |ui: &mut Ui, codes: &mut [u8; 4], names: [&str; 2]| {
+            for (i, n) in names.iter().enumerate() {
+                w::split(ui, n, |ui| keycode_combo(ui, ("slot", i), &mut codes[i], 180.));
+            }
+        };
+        match self.adv_kind {
+            0 => {
+                w::place(ui, r[0], |ui| {
+                    w::card(ui, "Actuation point", Some(&format!("{label} · dynamic keystroke")), |ui| {
+                        w::slider(ui, "First point", &format!("{:.1} mm", self.first), &mut self.first, 0.5..=2.5, 0.1);
+                        w::para(ui, "The firmware takes one DKS point.", w::body(12.), pal().dim);
+                    })
+                });
+                w::place(ui, r[1], |ui| {
+                    w::card(ui, "Stages", Some("●  fires once  ·  ▬  held through the stage  ·  click a cell to cycle"), |ui| self.stage_matrix(ui))
+                });
+            }
+            1 => {
+                w::place(ui, r[0], |ui| {
+                    w::card(ui, "Mod-tap", Some(&format!("{label} · hold for one action, tap for another")), |ui| {
+                        w::slider_int(ui, "Hold timeout", &format!("{} ms", self.timeout), &mut self.timeout, 10.0..=1000., 10.);
+                    })
+                });
+                w::place(ui, r[1], |ui| w::card(ui, "Actions", None, |ui| actions(ui, &mut self.codes, ["Hold", "Tap"])));
+            }
+            2 => {
+                w::place(ui, r[0], |ui| {
+                    w::card(ui, "Toggle", Some(&format!("{label} · latch an action")), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.;
+                            for (i, n) in (0u8..).zip(["Type 1", "Type 2"]) {
+                                if w::button(ui, n, Kind::Seg(self.toggle_kind == i)).clicked() {
+                                    self.toggle_kind = i;
+                                }
+                            }
+                        });
+                    })
+                });
+                w::place(ui, r[1], |ui| w::card(ui, "Actions", None, |ui| actions(ui, &mut self.codes, ["Toggle action", "Base action"])));
+            }
+            _ => {
+                w::place(ui, r[0], |ui| {
+                    w::card(ui, "Macro", Some(&format!("{label} · plays recorded events")), |ui| {
+                        w::slider_int(ui, "Macro slot", &format!("{}", self.macro_id as u16 + 1), &mut self.macro_id, 0.0..=255., 1.);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.;
+                            for (i, n) in (0u8..).zip(["Once", "Toggle", "Hold"]) {
+                                if w::button(ui, n, Kind::Seg(self.repeat == i)).clicked() {
+                                    self.repeat = i;
+                                }
+                            }
+                        });
+                    })
+                });
+                w::place(ui, r[1], |ui| {
+                    w::card(ui, "Events", Some("One per line: KeyA down 50 (delay after, ms)"), |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut self.macro_text).font(w::mono(13.)).desired_rows(7).desired_width(f32::INFINITY));
+                    })
+                });
+            }
+        }
+        let rows: Vec<(u8, String, String)> =
+            self.state.current().advanced.iter().map(|(k, a)| (*k, adv_name(a), adv_extra(a))).collect();
+        w::place(ui, r[2], |ui| {
+            w::card(ui, "Bindings on this layer", None, |ui| {
+                ui.spacing_mut().item_spacing.y = 14.;
+                if rows.is_empty() {
+                    w::para(ui, "Pick a key and type, then + Add binding.", w::body(13.), pal().dim);
+                }
+                egui::ScrollArea::vertical().id_salt("bindings").show(ui, |ui| {
+                    for (k, n, x) in rows {
+                        if w::list_item(ui, w::key_label(k), &n, &x, k == self.key).clicked() {
+                            self.select_adv(k);
+                        }
+                    }
+                });
+            })
+        });
+    }
+    /// The firmware stores one action (slot) and one mode per stage (CreateDKSModes).
+    fn stage_matrix(&mut self, ui: &mut Ui) {
+        ui.spacing_mut().item_spacing = vec2(6., 6.);
+        let cw = ((ui.available_width() - 84. - 24.) / 4.).floor();
+        let cell = |ui: &mut Ui, s: &str, width: f32, font: egui::FontId, color: Color32| {
+            let (r, _) = ui.allocate_exact_size(vec2(width, w::CONTROL_H), Sense::hover());
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, s, font, color);
+        };
+        if cw < 72. {
+            for (i, stage) in STAGES.iter().enumerate() {
+                egui::Frame::new().fill(pal().surface2).corner_radius(8).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        cell(ui, stage, 84., w::body(12.), pal().muted);
+                        let combo = (ui.available_width() - 52.).max(60.);
+                        ui.allocate_ui(vec2(combo, w::CONTROL_H), |ui| keycode_combo(ui, ("stage", i), &mut self.codes[i], combo - 8.));
+                        if w::stage_cell(ui, self.modes[i], 40.).clicked() {
+                            self.modes[i] = (self.modes[i] + 1) % 3;
+                        }
+                    });
+                });
+            }
+            return;
+        }
+        ui.horizontal(|ui| {
+            cell(ui, "", 84., w::body(12.), pal().dim);
+            for s in STAGES {
+                cell(ui, s, cw, w::body(12.), pal().dim);
+            }
+        });
+        for row in 0..2 {
+            egui::Frame::new().fill(pal().surface2).corner_radius(8).show(ui, |ui| {
+                // Every cell gets an absolute rect in the row, so a combo can never push the
+                // next one down (egui's centred rows re-centre on whatever grew last).
+                let (line, _) = ui.allocate_exact_size(vec2(84. + 4. * (cw + 6.), w::CONTROL_H), Sense::hover());
+                let at = |x: f32, width: f32| egui::Rect::from_min_size(pos2(line.left() + x, line.top()), vec2(width, w::CONTROL_H));
+                let label = at(0., 84.);
+                ui.painter().text(label.center(), egui::Align2::CENTER_CENTER, ["Sends", "Mode"][row], w::strong(13.), pal().text);
+                for i in 0..4 {
+                    let slot = at(90. + i as f32 * (cw + 6.), cw);
+                    let builder = egui::UiBuilder::new().max_rect(slot).layout(Layout::top_down(Align::Center));
+                    ui.scope_builder(builder, |ui| {
+                        if row == 0 {
+                            keycode_combo(ui, ("stage", i), &mut self.codes[i], cw - 8.);
+                        } else if w::stage_cell(ui, self.modes[i], cw).clicked() {
+                            self.modes[i] = (self.modes[i] + 1) % 3;
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    fn performance(&mut self, ui: &mut Ui) {
+        let pi = self.state.profile as usize;
+        let pr = &mut self.state.profiles[pi];
+        w::card_with(ui, 20, false, false, "Polling rate", Some("How often the keyboard reports to the PC"), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(6., 6.);
+                for rate in RATES {
+                    if w::button(ui, &format!("{rate} Hz"), Kind::Seg(pr.polling == rate)).clicked() {
+                        pr.polling = rate;
+                    }
+                }
+            });
+            w::para(ui, "8000 Hz gives the lowest latency but uses more CPU. Drop to 1000 Hz if you see stutter.", w::body(12.), pal().dim);
+        });
+        let r = w::row(ui, &[0., 0.], 190.);
+        w::place(ui, r[0], |ui| {
+            w::card(ui, "Debounce", Some("Ignores chatter after a press"), |ui| {
+                w::slider_int(ui, "Debounce time", &format!("{} ms", pr.debounce), &mut pr.debounce, 0.0..=100., 5.);
+                w::para(ui, "Hall-effect switches rarely need more than 5 ms.", w::body(12.), pal().dim);
+            })
+        });
+        w::place(ui, r[1], |ui| {
+            w::card(ui, "Sleep", Some("Turns lighting off when idle"), |ui| {
+                let mut on = pr.sleep != 0;
+                let now = if on { format!("Currently after {} min", pr.sleep / 60) } else { "Currently never".into() };
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.;
+                        w::text(ui, "Sleep on USB", w::body(13.), pal().text);
+                        w::text(ui, now, w::body(12.), pal().dim);
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if w::toggle(ui, &mut on).changed() {
+                            pr.sleep = if on { 300 } else { 0 };
+                        }
+                    });
+                });
+                let mut min = (pr.sleep / 60).max(1);
+                ui.add_enabled_ui(on, |ui| {
+                    if w::slider_int(ui, "Idle time", &format!("{min} min"), &mut min, 1.0..=60., 1.).changed() {
+                        pr.sleep = min * 60;
+                    }
+                });
+            })
+        });
+    }
+
+    fn device(&mut self, ui: &mut Ui) {
+        let fw = |i: usize| self.fw.get(i).map_or_else(|| "—".to_string(), |s| s.trim_start_matches(|c: char| c.is_ascii_uppercase()).into());
+        let r = w::row(ui, &[0., 0.], 194.);
+        w::place(ui, r[0], |ui| {
+            w::card(ui, "Firmware", None, |ui| {
+                w::kv_select(ui, "Keyboard", &fw(0), w::mono(13.));
+                w::kv_select(ui, "RF", &fw(1), w::mono(13.));
+                w::kv_select(ui, "LED", &fw(2), w::mono(13.));
+                w::para(ui, "Firmware updates are not supported on Linux.", w::body(12.), pal().dim);
+            })
+        });
+        w::place(ui, r[1], |ui| {
+            w::card(ui, "Connection", None, |ui| {
+                w::kv(ui, "Mode", if self.dry { "Dry run" } else { "USB" }, w::mono(13.));
+                w::kv_select(ui, "Settings port", &format!("{} · FFFF/02", self.ports[0]), w::mono(13.));
+                w::kv_select(ui, "Events port", &format!("{} · FFFF/01", self.ports[1]), w::mono(13.));
+            })
+        });
+        let full = device::state_path().map(|p| p.display().to_string()).unwrap_or_default();
+        let path = match dirs::home_dir() {
+            Some(h) => full.replacen(&*h.to_string_lossy(), "~", 1),
+            None => full.clone(),
+        };
+        let mut action = None;
+        let idle = self.dialog.is_none();
+        let r = w::row(ui, &[0., 360.], 168.);
+        w::place(ui, r[0], |ui| w::card(ui, "Saved settings", Some("The keyboard cannot report most settings back, so the app keeps a copy"), |ui| {
+            w::split(ui, "File", |ui| {
+                if w::icon_button(ui, egui_phosphor::regular::COPY, "Copy path").clicked() {
+                    ui.ctx().copy_text(full.clone());
+                }
+                ui.add(egui::Label::new(egui::RichText::new(&path).font(w::mono(13.)).color(pal().text)).selectable(true).truncate());
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(10., 10.);
+                for (i, (l, tip)) in [
+                    ("Export…", "Save the applied settings to a file"),
+                    ("Import…", "Load a settings file into the editor (nothing is written until Apply)"),
+                    ("Re-apply everything", "Send this slot's saved lighting, actuation, keys and performance again"),
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if ui.add_enabled_ui(idle || i == 2, |ui| w::button(ui, l, Kind::Secondary)).inner.on_hover_text(*tip).clicked() {
+                        action = Some(i);
+                    }
+                }
+            });
+        }));
+        let mut colours = self.colours;
+        w::place(ui, r[1], |ui| {
+            w::card(ui, "Appearance", Some("Colours only; the layout is the same either way"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(6., 6.);
+                    let theme = self.theme.name.as_deref().map_or_else(|| "Omarchy theme".into(), |n| format!("{n} theme"));
+                    let found = self.theme.palette.is_some();
+                    let omarchy = ui.add_enabled_ui(found, |ui| w::button(ui, &theme, Kind::Seg(colours == Colours::Omarchy))).inner;
+                    if omarchy.on_disabled_hover_text("No Omarchy theme found").clicked() {
+                        colours = Colours::Omarchy;
+                    }
+                    if w::button(ui, "Amber", Kind::Seg(colours == Colours::Amber)).clicked() {
+                        colours = Colours::Amber;
+                    }
+                });
+                w::para(ui, "Omarchy colours follow theme changes as they happen.", w::body(12.), pal().dim);
+            })
+        });
+        if colours != self.colours {
+            self.colours = colours;
+            theme::apply(ui.ctx(), self.theme.palette(colours));
+            if let Err(e) = colours.save() {
+                self.notice = Some((format!("Could not save the colour choice: {e}"), true));
+            }
+        }
+        match action {
+            Some(i @ (0 | 1)) => self.open_dialog(&ui.ctx().clone(), i == 0),
+            Some(_) => {
+                let mut s = self.applied.clone();
+                (s.profile, s.layer) = (self.state.profile, self.state.layer);
+                let r = (|| {
+                    let mut r = state::activate_reports(&s)?;
+                    let pr = &s.profiles[s.profile as usize];
+                    r.extend([p::report_rate(s.profile, pr.polling)?, p::debounce(pr.debounce)?, p::set_sleep(pr.sleep)]);
+                    r.extend(state::key_changes(&s, &State::default())?);
+                    Ok(r)
+                })();
+                self.write(r, None);
+            }
+            None => {}
+        }
+        let mut act = None;
+        let calib = if self.calib == 0 { "Start calibration".to_string() } else { format!("Calibration step {}/4", self.calib + 1) };
+        w::card_with(ui, 20, false, true, "Danger zone", Some("These write to the keyboard immediately"), |ui| {
+            for (title, desc, label, word) in [
+                ("Calibrate switches", "Release all keys, then press each key fully when asked", calib.as_str(), "CALIBRATE"),
+                ("Factory reset", "Erases all profiles, lighting and keymaps on the board", "Reset keyboard", "RESET"),
+            ] {
+                let text = |ui: &mut Ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.;
+                        w::text(ui, title, w::body(13.), pal().text);
+                        w::text(ui, desc, w::body(12.), pal().dim);
+                    });
+                };
+                let mut button = |ui: &mut Ui| {
+                    let tip = format!("Type {word} in the box below to unlock");
+                    // Both danger buttons share one width so their edges line up.
+                    if ui.add_enabled_ui(self.confirm == word, |ui| w::button_w(ui, label, Kind::Danger, Some(176.))).inner.on_disabled_hover_text(tip).clicked() {
+                        act = Some(word);
+                    }
+                };
+                // Narrow tiles stack the button under its description.
+                if ui.available_width() >= 560. {
+                    ui.horizontal(|ui| {
+                        text(ui);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| button(ui));
+                    });
+                } else {
+                    text(ui);
+                    button(ui);
+                }
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.confirm)
+                    .hint_text("Type RESET or CALIBRATE to unlock")
+                    .desired_width(270.)
+                    .margin(vec2(12., 8.)),
+            );
+        });
+        match act {
+            Some("CALIBRATE") => {
+                self.calib += 1;
+                let stage = self.calib;
+                if stage == 4 {
+                    self.calib = 0;
+                    self.confirm.clear();
+                }
+                self.write(p::calibration(stage).map(|r| vec![r]), None);
+            }
+            Some(_) => {
+                self.confirm.clear();
+                self.write(Ok(vec![p::reset()]), None);
+            }
+            None => {}
+        }
+    }
+}
+impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.tx.send(Command::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll();
+        while let Ok(t) = self.theme_rx.try_recv() {
+            theme::apply(ctx, t.palette(self.colours));
+            self.theme = t;
+        }
+        self.poll_dialog();
+        self.shortcuts(ctx);
+        // Worker events arrive on a channel; poll it only while some can arrive. Idle windows
+        // draw nothing (theme and dialog threads wake the UI themselves).
+        if self.busy || self.live {
+            ctx.request_repaint_after(std::time::Duration::from_millis(if self.live { 33 } else { 50 }));
+        }
+        let c = pal();
+        let size = ctx.input(|i| i.content_rect().size());
+        let side = 248.;
+        let pad: i8 = if size.x - side >= 1000. { 32 } else { 20 };
+        egui::SidePanel::left("nav")
+            .exact_width(side)
+            .resizable(false)
+            .frame(egui::Frame::new().fill(c.panel).inner_margin(egui::Margin { left: 16, right: 16, top: pad, bottom: 20 }))
+            .show(ctx, |ui| self.sidebar(ui));
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(c.bg)).show(ctx, |ui| {
+            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                egui::Frame::new().inner_margin(pad).show(ui, |ui| {
+                    // Content follows the window; only below ~360 px does it scroll sideways.
+                    ui.set_width(ui.available_width().max(360.));
+                    ui.spacing_mut().item_spacing.y = 20.;
+                    self.header(ui);
+                    ui.add_enabled_ui(!self.busy, |ui| {
+                        ui.spacing_mut().item_spacing.y = 20.;
+                        match self.screen {
+                            Screen::Lighting => self.lighting(ui),
+                            Screen::Actuation => self.actuation(ui),
+                            Screen::Keymap => self.keymap(ui),
+                            Screen::Advanced => self.advanced(ui),
+                            Screen::Performance => self.performance(ui),
+                            Screen::Device => self.device(ui),
+                        }
+                    });
+                });
+            });
+        });
+    }
+}

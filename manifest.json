@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.tg5ee.inglorious-core-linux",
+  "name": "Inglorious Core Linux",
+  "version": "0.1.0",
+  "author": "thomas griffin",
+  "license": "MIT",
+  "description": "Unofficial Linux configurator for the Glorious GMMK 3 HE 75%: lighting, actuation, keymap and advanced keys. Not affiliated with Glorious.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Inglorious Core Linux",
+    "description": "Open (or focus) Inglorious Core Linux.",
+    "category": "Hardware",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
