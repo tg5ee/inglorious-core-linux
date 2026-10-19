@@ -34,6 +34,8 @@ even while the app is closed. The keyboard still runs its own animation; only th
 colour changes, so Wave, Breathing, Ripple Graff and the rest play in the theme
 colour. Side lights come along when they follow the keyboard.
 
+![Follow theme: switching from Andromeda to Sakura Mochi and back recolours the app and the Wave #1 effect](demo-theme-sync.gif)
+
 - The board takes one colour per effect. Multicolour mode is the firmware's own
   rainbow, and Glorious Mode, Acid Mode, Rainbow and Heartbeat Sensor always use
   firmware colours, so those are left as they are.
