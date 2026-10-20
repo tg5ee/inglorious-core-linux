@@ -26,6 +26,9 @@ Not yet tried on hardware: keymap, advanced keys (DKS, mod-tap, toggle, macros),
 debounce, sleep, calibration and factory reset. The board keeps its settings in
 flash, so treat those as experimental. Nothing is written until you press Apply.
 
+Have a different Glorious keyboard? See [CONTRIBUTING.md](CONTRIBUTING.md) for how to
+add support for it.
+
 ## Follow your Omarchy theme
 
 Turn on **Follow theme** (Lighting → Colour → Base colour) and the keyboard's base
